@@ -1,0 +1,251 @@
+好。下面我把 **Phase4（Loop / Pause / Confirm）** 抽象成**与代码无关、可复用、可审计**的**形式化时序规范**。
+你可以把它当成 **Process V2 的“Phase4 语义契约”**，后面无论是 Cylinder / EPos / 多对象并发，都必须满足这套约束。
+
+---
+
+# Phase4（Advance / Loop / Pause）形式化规范（V2）
+
+> 目标：
+> **在扫描式 PLC 中，定义一个“可暂停、可确认、可循环”的推进阶段，且保证：**
+>
+> * Pause 期间状态冻结
+> * Confirm 只释放 Pause，不改变 RunLatched
+> * Loop 计数严格按“完成一次迭代”计算
+
+---
+
+## 1. 名词与状态定义（State Model）
+
+### 1.1 核心状态量
+
+* `Inner_Phase = 4`
+  表示流程已完成本 Step 的动作与等待，进入“推进决策阶段”
+
+* `LoopId = g`
+  本 Step 绑定的循环编号（工程语义 1..N）
+
+* `idx = g - 1`
+  内部数组索引（0..N-1）
+
+* `Inner_LoopCnt[idx] : INT`
+  当前 Step 在 LoopId=g 下已完成的**迭代次数**
+
+* `Inner_PauseArmed[idx] : BOOL`
+  Pause 门状态（TRUE = 当前需要暂停等待确认）
+
+* `ConfirmR : BOOL`
+  Confirm 的**一次性确认事件**（严格上升沿，S1）
+
+---
+
+## 2. 不变量（Invariants）——**任何实现都必须满足**
+
+### INV-1：Pause 冻结不变量
+
+> 当 `Inner_PauseArmed[idx] = TRUE` 且 `ConfirmR = FALSE` 时，本扫描周期内：
+
+* ❌ 不允许修改 `Inner_LoopCnt`
+* ❌ 不允许修改 `Inner_StepNo`
+* ❌ 不允许修改 `Inner_Phase`
+* ❌ 不允许推进 Jump / NextStep
+* ✅ 必须立即 `RETURN`
+
+> **一句话**：Pause = 完整冻结
+
+---
+
+### INV-2：LoopCnt 语义不变量
+
+> `Inner_LoopCnt[idx]` **只允许在“完成一次循环迭代”时 +1**
+
+严禁以下行为：
+
+* ❌ 在 Pause 等待期间自增
+* ❌ 在同一迭代中多次自增
+* ❌ 因扫描周期重复而自增
+
+---
+
+### INV-3：Confirm 语义不变量（S1）
+
+> `Confirm` 的作用 **仅限于释放 Pause**
+
+* ConfirmR = TRUE 时：
+
+  * ✅ 清除 `Inner_PauseArmed[idx]`
+  * ❌ 不修改 `RunLatched`
+  * ❌ 不依赖 `Start`
+* Confirm 必须是**一次性事件**（需要 ConfirmArm 或等价机制）
+
+---
+
+## 3. Phase4 的三段式时序（Formal Timeline）
+
+### Phase4 被拆成三个**严格有序**的子阶段：
+
+---
+
+## Phase4-A：Pause 检查与冻结（Freeze Gate）
+
+**触发条件**：
+
+```
+Inner_Phase = 4
+AND Inner_PauseArmed[idx] = TRUE
+```
+
+**行为规范**：
+
+```
+Proc_State := 500
+
+IF ConfirmR = FALSE THEN
+    RETURN    // 立即冻结（INV-1）
+ELSE
+    Inner_PauseArmed[idx] := FALSE
+    ConfirmArm := FALSE   // 要求松开再按（S1）
+    // 允许继续执行本扫描后续逻辑
+END_IF
+```
+
+> 说明：
+
+* Pause 的“冻结点”**必须在任何计数/推进之前**
+* ConfirmR 只是“解锁”，不是“启动”
+
+---
+
+## Phase4-B：完成一次循环迭代（Commit Iteration）
+
+**触发条件**：
+
+```
+通过 Phase4-A（未冻结）
+AND 循环条件成立（RepeatTotal > 1 且 LoopId 合法）
+```
+
+**行为规范**：
+
+```
+Inner_LoopCnt[idx] := Inner_LoopCnt[idx] + 1
+```
+
+> 这是 **LoopCnt 唯一允许 +1 的地方**（INV-2）
+
+---
+
+## Phase4-C：Pause 上膛 + 推进决策（Decision）
+
+### C1. Pause 上膛规则
+
+```
+IF PauseEvery > 0
+AND (Inner_LoopCnt[idx] MOD PauseEvery = 0) THEN
+    Inner_PauseArmed[idx] := TRUE
+```
+
+> 注意：
+>
+> * 上膛 ≠ 立刻冻结
+> * 是否“同一扫描冻结”是**策略选择**（见第 5 节）
+
+---
+
+### C2. 推进规则（严格互斥）
+
+**分支 1：继续循环**
+
+```
+IF Inner_LoopCnt[idx] < RepeatTotal THEN
+    StepNo := JumpStepNo (若配置)
+    Phase := 1
+    RETURN
+```
+
+**分支 2：循环结束，进入下一步**
+
+```
+ELSE
+    Inner_LoopCnt[idx] := 0
+    StepNo := StepNo + 1
+    Phase := 1
+    RETURN
+```
+
+---
+
+## 4. 两种合法 Pause 策略（A / B），你现在用的是 A
+
+### 策略 A（你当前“能跑”的版本）
+
+> **Pause 在“下一扫描”生效**
+
+* PauseEvery 上膛后：
+
+  * 本扫描仍完成 C2（Jump / NextStep）
+  * 下一扫描在 Phase4-A 冻结
+
+**特性**：
+
+* 手感顺
+* Pause 位置在“一次迭代结束之后”
+
+---
+
+### 策略 B（更硬边界）
+
+> **Pause 在“同一扫描”生效**
+
+* PauseEvery 上膛后：
+
+  * 立刻 `Proc_State=500`
+  * `RETURN`
+
+**特性**：
+
+* 边界精确
+* 更像“急停在计数点”
+
+---
+
+### ⚠️ 无论 A / B，以下规则不能破
+
+> **冻结必须发生在 LoopCnt++ 之前，或保证 Pause 期间不会再执行 LoopCnt++**
+
+这是你这次事故的根因边界。
+
+---
+
+## 5. 你现在这套代码为什么是“正确实现”
+
+你当前能跑的代码，**严格满足了三条不变量**：
+
+* Pause 冻结发生在 LoopCnt++ 之前（INV-1）
+* LoopCnt 只在“非 Pause 的扫描”中 +1（INV-2）
+* Confirm 只解锁 Pause，不触发 Start（INV-3）
+
+这就是为什么：
+
+* LoopCnt 不再暴涨
+* Confirm 不再“放行后直接跑到 100”
+* Pause / Resume 行为可预测
+
+---
+
+## 6. 你可以直接用的一句“工程级定义”
+
+> **Phase4 是一个三段式推进器：
+> 先冻结（Pause Gate），
+> 再提交一次循环迭代（Commit），
+> 最后做推进决策（Jump / Next）。
+>
+> Pause 冻结的时间语义优先级高于所有计数与推进。**
+
+---
+
+如果你愿意，下一步我可以帮你把这套**形式化规范**直接映射成：
+
+* 一张 **Phase4 状态转移表**
+* 或一份 **“禁止写法 / 推荐写法”清单**（给以后扩展 Servo / EPos 用）
+
+你选哪一个，我们继续。
