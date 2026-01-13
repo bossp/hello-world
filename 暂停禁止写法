@@ -1,0 +1,221 @@
+下面给你一份 **“禁止写法 / 推荐写法”清单**，专门面向你后续把 Phase4 语义推广到 **Servo / EPos / 异步电机 / 气缸混用** 的场景。它的目标是：**避免再出现这次 LoopCnt 爆炸、Pause 失真、Confirm 失效、流程跑穿** 这类扫描式时序坑。
+
+---
+
+# Phase4 禁止写法清单（严禁）
+
+## 禁止 1：Pause 冻结之前做任何“推进性写入”
+
+**典型坏写法：**
+
+```scl
+LoopCnt := LoopCnt + 1;     // ❌ 先加
+IF PauseArmed THEN RETURN;  // ❌ 再冻
+```
+
+**后果：**Pause 期间每扫描自增 → LoopCnt 爆炸 → Confirm 放行后误判“循环已完成” → 跳步/结束。
+
+✅ **规则：冻结点必须高于所有推进性写入**（计数、StepNo、Phase、CmdID 都算）。
+
+---
+
+## 禁止 2：Pause 状态下继续改变 Step/Phase/计数/组号
+
+**典型坏写法：**
+
+```scl
+IF PauseArmed THEN
+   Proc_State := 500;
+   ActiveGroup := ActiveGroup + 1; // ❌
+END_IF;
+```
+
+**后果：**Pause 表面停住，但内部状态漂移，恢复后行为不可预测。
+
+✅ **规则：Pause=完整冻结**（除了显示状态码、等待 ConfirmR，其他都不许写）。
+
+---
+
+## 禁止 3：把 Confirm 当电平信号使用（S1 场景）
+
+**典型坏写法：**
+
+```scl
+IF Confirm THEN PauseArmed := FALSE;  // ❌ 电平放行
+```
+
+**后果：**保持型按钮在上电/下载时可能为 TRUE，Pause 直接被自动放行；或者 Confirm 一直 TRUE 导致多次误放行。
+
+✅ **规则：S1 必须用 ConfirmR（一次性事件）**，必要时配 ConfirmArm。
+
+---
+
+## 禁止 4：ConfirmR 生效后“同一扫描跑太多分支”且无刹车点
+
+**典型坏写法：**
+
+```scl
+IF ConfirmR THEN PauseArmed := FALSE; END_IF;
+// 接着继续执行 Step++ / Jump / Done / 清RunLatched ...  // ❌ 没有明确边界
+```
+
+**后果：**Confirm 看似按了，但同一扫描把流程推进到 Done/Idle，监控时像“Confirm 没作用”。
+
+✅ **规则：ConfirmR 只能解除 Pause；推进应当有明确边界（A策略 or B策略）**。
+
+---
+
+## 禁止 5：循环“推进事件”和“暂停门上膛”在同一扫描无序交织
+
+**典型坏写法：**
+
+```scl
+IF PauseEvery命中 THEN PauseArmed := TRUE; END_IF;
+IF LoopCnt < RepeatTotal THEN Jump; ELSE Next; END_IF; // ❌ 无序
+```
+
+**后果：**Pause 点漂移：有时停在迭代末、有时停在跳转前，调试极难。
+
+✅ **规则：必须固定顺序：Freeze → Commit(LoopCnt++) → ArmPause → Decide(Jump/Next)**。
+
+---
+
+## 禁止 6：用多个地方写 LoopCnt（同一周期可能写两次）
+
+**典型坏写法：**
+
+```scl
+// 在 Phase2/Phase3 也加过一次
+IF doneCond THEN LoopCnt++ END_IF;
+// Phase4 又加一次
+LoopCnt++  // ❌
+```
+
+**后果：**迭代次数错乱，PauseEvery/RepeatTotal全失真。
+
+✅ **规则：LoopCnt 只能在 Phase4 的“Commit Iteration”位置写一次**。
+
+---
+
+## 禁止 7：把“配置错误/目标错误”当作 Pause 或正常推进的一部分
+
+**典型坏写法：**
+
+```scl
+IF TargetIdx invalid THEN
+   Proc_State := 500; // ❌ 混淆 Pause 和 Error
+END_IF;
+```
+
+**后果：**现场以为暂停了，实际是配置错误；HMI/调试误判。
+
+✅ **规则：Pause（500）只用于暂停；错误用独立码（7xx/6xx/9xx），并锁存/可复位**。
+
+---
+
+# Phase4 推荐写法清单（强烈建议）
+
+## 推荐 1：三段式结构固定模板（Freeze / Commit / Decide）
+
+**推荐模板：**
+
+1. **Freeze Gate**：`IF PauseArmed AND NOT ConfirmR THEN RETURN`
+2. **Commit**：`LoopCnt++`（只在允许推进时发生）
+3. **Arm Pause**：命中 PauseEvery → `PauseArmed := TRUE`（A/B策略）
+4. **Decide**：`if LoopCnt<RepeatTotal jump else LoopCnt:=0; step++`
+
+> 这套模板对 Cylinder / Servo / EPos 完全通用。
+
+---
+
+## 推荐 2：明确选择 Pause 策略 A 或 B，并写进注释
+
+* **策略 A（顺滑）**：上膛后下一扫描才冻结（你现在用的）
+* **策略 B（硬边界）**：上膛当扫立刻冻结（更像急停）
+
+✅ 推荐：项目级固定一种策略，不要混用。
+
+---
+
+## 推荐 3：Confirm 保持型 → 必须“松开再按”的门禁（ConfirmArm）
+
+**推荐写法：**
+
+```scl
+IF NOT Confirm THEN ConfirmArm := TRUE; END_IF;
+ConfirmR := Confirm AND NOT ConfirmOld AND ConfirmArm;
+ConfirmOld := Confirm;
+```
+
+并在消费 ConfirmR 时：
+
+```scl
+ConfirmArm := FALSE;  // 强制松开再按
+```
+
+---
+
+## 推荐 4：PauseArmed 只由两类事件修改
+
+* 上膛：PauseEvery 命中 → `PauseArmed := TRUE`
+* 释放：ConfirmR → `PauseArmed := FALSE`
+
+✅ 不要让其它任何逻辑写 PauseArmed（否则你以后多对象、嵌套循环必炸）。
+
+---
+
+## 推荐 5：所有“数组索引语义”统一一条规则并固化
+
+* 外部配置：`LoopId = 1..LoopIdMax`
+* 内部数组：`idx = LoopId - 1`（0..LoopIdMax-1）
+* 所有数组访问只用 `idx`
+
+✅ 强烈建议你现在这样：
+
+```scl
+idx := g - 1;
+```
+
+现场调试可视化最好。
+
+---
+
+## 推荐 6：在 Phase4 加“防跑穿”观测钩子（不改功能，但极好调试）
+
+建议加一个静态调试字（可选）：
+
+* `Dbg_Ph4Stage : INT`
+
+  * 10=FreezeWait
+  * 20=Commit
+  * 30=ArmPause
+  * 40=DecideJump
+  * 50=DecideNext
+
+这能让你以后 EPos / 多轴插补调试时快 10 倍。
+
+---
+
+# 面向 Servo / EPos 扩展的额外建议（你后面一定会踩）
+
+## 推荐 7：把“轴动作完成”与“流程推进”完全分离
+
+* Servo/EPos 的 Done/PosOk/AxisEnabled 等只影响 Phase2 的 doneCond
+* **Phase4 永远只处理：循环/暂停/跳转/步进**
+
+否则你一旦“轴在 Pause 状态仍在更新某些完成标志”，又会引发类似“状态漂移”。
+
+---
+
+# 最简“审计检查表”（你以后每次改 Phase4 都按这个过一遍）
+
+1. Pause 等待时是否 RETURN？（没有 RETURN=必炸）
+2. Pause 等待时 LoopCnt 是否可能被写？（能写=必炸）
+3. LoopCnt 是否只在一个位置 +1？（多处写=必炸）
+4. Confirm 是 ConfirmR 事件而不是电平？（电平=误触发）
+5. 上膛 PauseArmed 后，冻结发生在何时（A/B）？是否一致？
+6. 是否存在“同一扫描推进到 Done/清RunLatched”的路径？（有=Confirm看似没用）
+
+---
+
+如果你同意，我下一步可以把这份清单进一步“落地”成你代码里的**注释模板**，直接贴在 `Phase4` 上方，让以后任何人改这段都知道不能越界写什么。
