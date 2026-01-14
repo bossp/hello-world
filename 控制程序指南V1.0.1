@@ -1,0 +1,912 @@
+Process Engine Phase4 Design Specification v1.0.1
+Normative Full Edition
+
+[NOTE]
+This file is being generated in multiple chunks due to size limits.
+This is PART 1. Subsequent parts will be appended automatically.
+
+---
+
+Status:
+This document is a normative specification.
+It defines hard constraints, formal semantics, default behaviors,
+and configurable policies for the Process V2 Engine, with special focus on:
+- Phase4
+- Loop
+- Pause
+- Confirm
+- Scan-based execution
+- Object integration
+- Motion integration
+- OMAC integration
+
+This is not a guideline.
+This is not a suggestion.
+This is a binding semantic contract.
+
+---
+
+Changelog from v1.0:
+
+1. Explicit default behaviors for all configurable semantics
+2. Formal lifecycle rules for LoopCnt
+3. Formal Commit gating semantics under Pause
+4. Explicit timer behavior under Pause
+5. Explicit alarm visibility semantics under Pause
+6. Confirm permission gating rules
+7. Explicit consumption rules for ConfirmR
+8. Explicit Process-visible freeze boundaries for objects
+9. LogicalAck evaluation strategy
+10. Safety override rules for motion
+11. Scoped permission model
+12. Explicit allowed updates during Freeze
+13. Expanded Policy Catalog with defaults
+
+---
+
+[CONTENT CONTINUES IN NEXT PART]
+
+==============================
+Process Engine Phase4 Design Specification v1.0.1
+Normative Full Edition
+==============================
+
+--------------------------------
+1. Scope & Purpose
+--------------------------------
+
+This specification defines the canonical behavior of the Process V2 engine under:
+
+- Phase-based execution
+- Loop iteration
+- Pause / Confirm control
+- Scan-based PLC execution
+
+It applies to:
+
+- Cylinder-based systems
+- Servo / EPos systems
+- PLCopen Motion systems
+- Multi-object coordination
+- OMAC / PackML integrated flows
+
+--------------------------------
+2. System Model
+--------------------------------
+
+The Process Engine is a scan-based discrete-time system.
+
+This implies:
+
+- The entire logic executes repeatedly
+- One full execution equals one scan cycle
+- There is no intrinsic event system
+- All events must be emulated through edge detection
+- Time is not continuous
+- Time is explicitly constructed
+
+--------------------------------
+3. Fundamental Assumptions
+--------------------------------
+
+A1. Scan-Based Execution
+
+All logic is evaluated every scan.
+If a variable is not explicitly frozen, it will be reevaluated and possibly overwritten.
+
+A2. No Native Event Semantics
+
+All events must be constructed from:
+- Edge detection
+- State transitions
+- Gated commits
+
+A3. Time is Discrete
+
+Time progresses only through Commit.
+
+--------------------------------
+4. Core Definitions
+--------------------------------
+
+4.1 Process
+
+A Process is a scheduler, not an executor.
+
+It:
+- Issues commands
+- Decides transitions
+- Orchestrates objects
+
+It does NOT:
+- Control IO
+- Contain hardware logic
+- Maintain device internal state
+
+4.2 Phase
+
+A Phase is a time decision window, not a physical action.
+
+4.3 Phase4
+
+Phase4 is the commit and decision layer.
+
+It is responsible for:
+- Loop counting
+- Pause gating
+- Transition decisions
+
+It must NOT:
+- Execute hardware
+- Change object states
+- Control IO
+
+--------------------------------
+5. Phase4 Formal Time Model
+--------------------------------
+
+Phase4 is decomposed into three strictly ordered stages:
+
+Freeze -> Commit -> Decide
+
+5.1 Phase4-A: Freeze Gate
+
+Purpose: Prevent time progression.
+
+Trigger:
+- Inner_Phase == 4
+- PauseArmed[idx] == TRUE
+
+Behavior:
+- If ConfirmR == FALSE: RETURN immediately
+- If ConfirmR == TRUE: Clear PauseArmed, allow progression
+
+This gate has absolute priority.
+
+5.2 Phase4-B: Commit
+
+Purpose: Advance time by one logical iteration.
+
+The only allowed operation:
+
+LoopCnt := LoopCnt + 1
+
+This must execute exactly once per iteration.
+
+5.3 Phase4-C: Decide
+
+Purpose: Determine next time direction.
+
+Includes:
+- Pause arming
+- Loop boundary decision
+- Step transitions
+
+--------------------------------
+6. Pause Semantics (Extended)
+--------------------------------
+
+Pause is not a UI state.
+Pause is a logical time-freeze mechanism.
+
+6.1 Core Definition
+
+When Pause is active, all progression variables must stop changing.
+
+This includes:
+- StepNo
+- Phase
+- LoopCnt
+- CmdID
+- Jump decisions
+- Group indices
+- Commit counters
+
+6.2 PauseCommitPolicy (Normative)
+
+PauseCommitPolicy ∈ { BLOCK, DEFER }
+Default: BLOCK
+
+BLOCK:
+- No Commit may occur while Pause is active
+
+DEFER:
+- Commit intent may be recorded
+- No progression variable may change
+- After Pause release, exactly one deferred Commit may occur
+
+Invariant:
+No progression variable may change during Pause.
+
+6.3 PauseTimerPolicy (Normative)
+
+PauseTimerPolicy ∈ { FROZEN, RUNNING, CONFIGURABLE }
+Default: FROZEN
+
+Scope:
+- StepTimeout
+- PostDelay
+- Internal process timers
+
+Invariant:
+Timer behavior must not advance logical time.
+
+6.4 AlarmVisibilityUnderPause (Normative)
+
+AlarmVisibilityUnderPause ∈ { IMMEDIATE, DEFERRED, CONFIGURABLE }
+Default: IMMEDIATE
+
+Invariant:
+Once an alarm is latched, the process must not Commit unless explicitly allowed.
+
+--------------------------------
+7. Confirm Semantics (Extended)
+--------------------------------
+
+Confirm uses S1 semantics.
+ConfirmR is the rising edge of Confirm.
+
+7.1 Core Rules
+
+Confirm does NOT:
+- Start the process
+- Reset the process
+- Modify RunLatched
+- Trigger Commit
+
+Confirm only releases Pause.
+
+7.2 Confirm and Permission Gating
+
+ConfirmR releases the Freeze Gate only.
+Commit is allowed only if AllowCommit == TRUE.
+
+7.3 Confirm Consumption Rule
+
+One ConfirmR consumes exactly one PauseGate.
+Broadcast release is forbidden.
+
+--------------------------------
+8. Loop Semantics (Extended)
+--------------------------------
+
+LoopCnt is an event counter.
+
+8.1 LoopCnt Lifecycle
+
+Default:
+- Cleared on Start
+- Cleared when reaching RepeatTotal
+- Not cleared on Jump
+
+8.2 Loop Nesting Rule
+
+Nested loops are NOT supported.
+One Step may belong to at most one LoopId.
+
+8.3 Jump Semantics
+
+Jump modifies StepNo only.
+Jump is not Commit.
+Jump does not modify LoopCnt.
+
+[MORE SECTIONS WILL FOLLOW]
+
+--------------------------------
+9. Valid Pause Strategies
+--------------------------------
+
+Two pause strategies are considered valid.
+
+Strategy A: Deferred Freeze (Default)
+
+- Current iteration completes
+- Freeze occurs on the next scan
+
+Characteristics:
+- Smooth operator experience
+- Pause point aligns with iteration boundary
+
+Strategy B: Immediate Freeze
+
+- Freeze occurs within the same scan
+- No Commit or Decide after freeze
+
+Characteristics:
+- Hard boundary
+- Emergency-like semantics
+
+Hard Constraint:
+
+Pause must never allow LoopCnt or any progression variable to change during freeze.
+
+--------------------------------
+10. Failure Case Analysis
+--------------------------------
+
+Observed Failure:
+
+LoopCnt incremented repeatedly during Pause scans.
+
+Effects:
+- Counter overflow
+- Premature loop termination
+- False Confirm behavior
+- Unexpected transition to Idle
+
+Root Cause:
+
+Freeze invariant was violated.
+Time progressed while logically frozen.
+
+Correction:
+
+All progression variables must be gated behind Freeze.
+
+--------------------------------
+11. Mandatory Structural Pattern
+--------------------------------
+
+Phase4 must follow this exact structural form:
+
+IF FreezeGateActive THEN
+    RETURN
+END_IF
+
+Commit
+
+Decide
+
+Any deviation from this order is invalid.
+
+--------------------------------
+12. Forbidden Patterns
+--------------------------------
+
+The following patterns are forbidden:
+
+- Modifying LoopCnt before FreezeGate
+- Modifying any progression variable while Pause is active
+- Using Confirm level instead of ConfirmR
+- Performing multiple Commits in a single scan
+- Combining Commit and Decide into one block
+- Allowing Jump to implicitly Commit
+
+--------------------------------
+13. Applicability & Extensibility
+--------------------------------
+
+This model applies to:
+
+- Cylinders
+- Servos
+- Motion axes
+- PLCopen Motion
+- Parallel flows
+- PackML / OMAC integrated systems
+
+This model may be extended to:
+
+- Multi-axis synchronization
+- Transactional steps
+- Reversible flows
+- Time-travel debugging
+
+All extensions must preserve:
+
+- Freeze semantics
+- Commit atomicity
+- Event-based time
+- Progression variable invariants
+
+[SECTIONS 14+ WILL FOLLOW]
+
+--------------------------------
+14. Design Axioms
+--------------------------------
+
+1. Time progresses only at Commit.
+2. Pause freezes logical time.
+3. All events must be edge-based.
+4. Loops are event-based, not scan-based.
+5. Phase4 is a transactional layer.
+6. Physical completion does not imply logical completion.
+7. Objects are autonomous.
+8. Motion is continuous, Process is discrete.
+9. OMAC provides state semantics, not time authority.
+10. Permissions are externalized.
+
+--------------------------------
+15. Glossary
+--------------------------------
+
+Scan:
+One full PLC execution cycle.
+
+Freeze Gate:
+Mechanism preventing time progression.
+
+Commit:
+Single atomic time advancement.
+
+Decide:
+Branching logic after commit.
+
+ConfirmR:
+Rising-edge confirm event.
+
+Progression Variables:
+Variables representing time progression.
+
+--------------------------------
+16. Object Layer Semantics (Extended)
+--------------------------------
+
+Objects are time-reactive autonomous state machines.
+
+They:
+- Receive commands
+- Evaluate feasibility
+- Execute internally
+- Report status
+- Generate alarms
+
+They must not:
+- Depend on process internals
+- Modify process time
+- Control global transitions
+
+--------------------------------
+16.1 Dual Domain Model
+
+Each object has two domains:
+
+1. Physical-Internal Domain
+   - Continuous
+   - Sensors, encoders, actuators
+   - Can evolve during Pause
+
+2. Process-Visible Domain
+   - Discrete
+   - Gated by Freeze
+   - Drives Process decisions
+
+--------------------------------
+16.2 Process-Visible Freeze Boundary
+
+Default: FROZEN
+
+The following fields are frozen under Pause by default:
+
+- Status
+- Busy
+- LogicalDone
+- Step-visible state
+- Progress indicators
+
+Physical telemetry (position, sensors) remains visible by default.
+
+--------------------------------
+16.3 Alarm Behavior Under Pause
+
+Default: IMMEDIATE
+
+Alarms:
+- May latch during Pause
+- Must be visible immediately
+- Must inhibit Commit unless policy allows
+
+--------------------------------
+16.4 Statistics Under Pause
+
+Default: FROZEN
+
+Statistics:
+- LastTime
+- AvgTime
+- LifeCnt
+
+Must not change while Pause is active unless explicitly configured.
+
+--------------------------------
+17. Motion Layer Semantics (Extended)
+--------------------------------
+
+Motion operates in continuous time.
+Process operates in discrete time.
+
+--------------------------------
+17.1 Commit-Gated Submission
+
+Motion commands may only be submitted at Commit.
+
+Retriggering per scan is forbidden.
+
+--------------------------------
+17.2 Dual Acknowledgement
+
+PhysicalAck:
+- Physical completion
+
+LogicalAck:
+- Discrete acceptance by Process
+
+Default: DUAL
+
+--------------------------------
+17.3 LogicalAck Evaluation
+
+LogicalAckEvaluation ∈ { SAMPLED_ON_COMMIT, EVENT_LATCHED, CONFIGURABLE }
+Default: SAMPLED_ON_COMMIT
+
+--------------------------------
+17.4 Pause Motion Policy
+
+PauseMotionPolicy ∈ { CONTINUE, HOLD, ABORT, CONFIGURABLE }
+Default: CONFIGURABLE
+
+--------------------------------
+17.5 Safety Override
+
+Safety systems may:
+- Force HOLD or ABORT
+- Raise Fault
+- Propagate to Process and OMAC
+
+Safety override does not alter time semantics.
+
+[SECTIONS 18+ WILL FOLLOW]
+
+--------------------------------
+18. OMAC / PackML Integration (Extended)
+--------------------------------
+
+OMAC / PackML provides system state semantics.
+It does not own time authority.
+
+--------------------------------
+18.1 Role of OMAC
+
+OMAC:
+- Classifies system state
+- Provides permission semantics
+- Does NOT advance time
+- Does NOT implement Commit
+- Does NOT implement Freeze/Decide
+
+--------------------------------
+18.2 Authority Model
+
+Process Engine: owns logical time
+Objects: own physical execution
+OMAC: owns state classification and permission gating
+
+--------------------------------
+18.3 Permission Model
+
+Permissions are externalized.
+
+OMAC provides permission vectors.
+Process consumes them as gates.
+
+--------------------------------
+18.4 Permission Levels
+
+GlobalPermissions:
+- AllowCommit
+- AllowPause
+- AllowManualOverride
+- AllowMotionSubmit
+- AllowAutoTransition
+
+ScopedPermissions (optional):
+- Per object type
+- Per object instance
+- Per command type
+
+Default: GlobalPermissions only
+
+--------------------------------
+18.5 Fault Propagation
+
+Faults propagate:
+Object -> Process -> OMAC
+
+--------------------------------
+19. Policy Catalog (Extended)
+--------------------------------
+
+All configurable behavior must be explicitly declared as policy.
+
+--------------------------------
+19.1 Pause Policies
+
+PauseCommitPolicy ∈ { BLOCK, DEFER }
+Default: BLOCK
+
+PauseTimerPolicy ∈ { FROZEN, RUNNING, CONFIGURABLE }
+Default: FROZEN
+
+PauseVisibilityPolicy ∈ { VISIBLE, FROZEN, CONFIGURABLE }
+Default: CONFIGURABLE
+
+AlarmVisibilityUnderPause ∈ { IMMEDIATE, DEFERRED, CONFIGURABLE }
+Default: IMMEDIATE
+
+--------------------------------
+19.2 Motion Policies
+
+PauseMotionPolicy ∈ { CONTINUE, HOLD, ABORT, CONFIGURABLE }
+Default: CONFIGURABLE
+
+MotionAckModel ∈ { DUAL, PHYSICAL_ONLY, LOGICAL_ONLY }
+Default: DUAL
+
+LogicalAckEvaluation ∈ { SAMPLED_ON_COMMIT, EVENT_LATCHED, CONFIGURABLE }
+Default: SAMPLED_ON_COMMIT
+
+--------------------------------
+19.3 Manual Override Policies
+
+ManualOverridePolicy ∈ { ALLOWED, BLOCKED, CONFIGURABLE }
+Default: CONFIGURABLE
+
+ManualWhilePausedPolicy ∈ { ALLOWED, BLOCKED, CONFIGURABLE }
+Default: CONFIGURABLE
+
+--------------------------------
+19.4 Commit Control Policies
+
+CommitPermissionPolicy ∈ { OMAC_DRIVEN, LOCAL }
+Default: OMAC_DRIVEN
+
+MultiCommitPolicy ∈ { FORBIDDEN, ALLOWED }
+Default: FORBIDDEN
+
+--------------------------------
+20. Architecture Invariants
+--------------------------------
+
+1. Logical time progresses only through Commit.
+2. Pause freezes logical time.
+3. Objects are autonomous.
+4. Motion is continuous, Process is discrete.
+5. OMAC does not own time authority.
+6. Physical completion does not imply logical completion.
+7. Permissions are externalized.
+
+--------------------------------
+21. Interface Specification
+--------------------------------
+
+Interfaces are semantic, not platform-bound.
+
+--------------------------------
+21.1 Process <-> Object Interface
+
+Inputs to Object:
+- Cmd
+- Mode
+- CmdID
+- Params
+
+Outputs to Process:
+- Status {Idle, Busy, Done, Error}
+- PhysicalDone
+- LogicalDone
+- Diag
+
+--------------------------------
+21.2 Process <-> Motion Interface
+
+Inputs to Motion:
+- MotionCmd
+- CmdID
+- Target
+- Profile
+
+Outputs to Process:
+- PhysicalAck
+- LogicalAck
+- MotionState
+- Fault
+
+--------------------------------
+21.3 OMAC <-> Process Permission Interface
+
+OMAC provides:
+- AllowCommit
+- AllowPause
+- AllowManualOverride
+- AllowMotionSubmit
+- AllowAutoTransition
+
+[SECTIONS 22+ WILL FOLLOW]
+
+--------------------------------
+22. Execution Semantics (Extended)
+--------------------------------
+
+This section defines the mandatory ordering and causality rules per scan.
+
+--------------------------------
+22.1 Single-Scan Ordering
+
+Within one scan, the following order is mandatory:
+
+1. Read inputs
+2. Evaluate Freeze Gates
+3. If frozen -> RETURN
+4. Perform Commit (if any)
+5. Perform Decide
+6. Emit outputs
+
+--------------------------------
+22.2 Freeze Priority Rule
+
+Freeze gates have absolute priority over all Commit and Decide operations.
+
+--------------------------------
+22.3 Commit Atomicity
+
+Each Commit represents exactly one logical time advancement.
+
+Multiple commits per scan are forbidden unless explicitly allowed by policy.
+
+--------------------------------
+22.4 Acknowledgement Ordering
+
+PhysicalAck:
+- May occur during Pause
+
+LogicalAck:
+- May only be recorded when not frozen
+
+--------------------------------
+22.5 Allowed Updates While Frozen
+
+Allowed:
+- Physical input sampling
+- Physical telemetry
+- Alarm latching
+- Health monitoring
+
+Forbidden:
+- StepNo
+- Phase
+- LoopCnt
+- CmdID
+- Group indices
+- Any Commit
+- Any transition
+
+--------------------------------
+23. Design Intent
+--------------------------------
+
+This architecture defines a time-consistent, platform-independent,
+object-driven process engine.
+
+It is designed to:
+
+- Prevent scan-based drift
+- Prevent pause leakage
+- Prevent multi-trigger errors
+- Support heterogeneous devices
+- Support OMAC integration
+- Support long-running flows
+
+--------------------------------
+24. Reference State Machines
+--------------------------------
+
+--------------------------------
+24.1 Object FSM
+
+States:
+- Idle
+- Busy
+- PhysicalDone
+- LogicalDone
+- Error
+- Held
+- Aborted
+
+Rules:
+- Idle -> Busy only via valid Cmd
+- Busy -> PhysicalDone when physical completion detected
+- PhysicalDone -> LogicalDone only when Process is not frozen and Commit is permitted
+- Any -> Error on fault
+- Busy -> Held only via PauseMotionPolicy
+- Held -> Busy or Aborted based on resume policy
+
+--------------------------------
+24.2 Motion FSM
+
+States:
+- Ready
+- Commanded
+- Executing
+- PhysicalDone
+- LogicalDone
+- Fault
+
+Rules:
+- Commanded only at Commit
+- Executing is continuous-time
+- PhysicalDone may occur while Process is frozen
+- LogicalDone may only occur on Commit
+
+--------------------------------
+24.3 Process FSM
+
+States:
+- Freeze
+- Commit
+- Decide
+- Transition
+
+Rules:
+- Freeze has highest priority
+- Commit is atomic
+- Decide must not modify time
+- Transition changes Step/Phase only
+
+--------------------------------
+25. Compliance Checklist
+--------------------------------
+
+--------------------------------
+25.1 Time Semantics
+
+[ ] Commit occurs at most once per scan
+[ ] No progression variables change during Pause
+[ ] Freeze gate evaluated before Commit
+[ ] Logical time never advances during Pause
+
+--------------------------------
+25.2 Event Semantics
+
+[ ] All events are edge-based
+[ ] No level-triggered events
+[ ] CmdID or equivalent tokenization is used
+
+--------------------------------
+25.3 Object Semantics
+
+[ ] Objects are autonomous
+[ ] Objects expose PhysicalDone and LogicalDone
+[ ] Object-to-Process interface is IO-free
+[ ] Pause visibility policy is respected
+
+--------------------------------
+25.4 Motion Semantics
+
+[ ] Motion commands are Commit-gated
+[ ] Dual acknowledgement is implemented
+[ ] PhysicalDone does not imply LogicalDone
+[ ] Pause motion policy is respected
+
+--------------------------------
+25.5 OMAC Integration
+
+[ ] OMAC does not implement Commit
+[ ] OMAC does not freeze time
+[ ] Permissions are externally supplied
+
+--------------------------------
+26. Implementation Guidance
+--------------------------------
+
+This section is non-normative.
+
+- Use explicit Freeze/Commit/Decide blocks
+- Centralize policy resolution
+- Centralize permission gating
+- Log all Commit points
+- Version all interface schemas
+- Never mix hardware logic into Process
+
+--------------------------------
+END OF SPECIFICATION
+--------------------------------
