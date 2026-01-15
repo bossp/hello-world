@@ -1,0 +1,162 @@
+好，走 **③-B：OMAC × AxisLifecycle × AxisMotionMode 三维对照表**。
+我会把它做成“规范级”——你拿去就能当 **权限矩阵/边界说明**，后面写代码也不会乱。
+
+> 说明（按你现状简化）：
+>
+> * **OMAC 上层**：只关心“系统处于什么模式（Production / Manual / Maintenance / Invalid）”
+> * **ServoCtrl.I_Mode**：由 OMAC 映射而来（Production→AUTO；Manual/Maintenance→MANUAL）
+> * **AxisLifecycle（③）**：只管“轴能不能动/是否故障/是否允许使能”
+> * **AxisMotionMode（①）**：只管“怎么动”（ABS/REL/VEL/JOG/INCJOG…）
+> * **Done/Commit（②）**：这里不展开，只要求：非 READY 时不产生 Done
+
+---
+
+# ③-B 三维对照表 v1.0（Normative）
+
+## A. 维度定义
+
+### A1) OMAC Mode（上层）
+
+* `OMAC_Production`
+* `OMAC_Manual`
+* `OMAC_Maintenance`
+* `OMAC_Invalid`（含 EmergencyStop/系统未就绪等）
+
+> 你的补充：“OMAC 4 单段模式对应走自动”——在本表里等价归入 `OMAC_Production`（即自动域）。
+
+### A2) AxisLifecycle（③，轴生命周期）
+
+* `LC_DISABLED`（硬/软不允许运动）
+* `LC_ENABLING`（使能过程中）
+* `LC_READY`（允许运动）
+* `LC_FAULT`（故障锁存）
+* `LC_RESETTING`（复位中）
+
+### A3) AxisMotionMode（①，运动模式）
+
+* `NONE`
+* `ABS`
+* `REL`
+* `VEL`
+* `JOG`
+* `INCJOG`
+* （预留：HOME / HOLD …）
+
+---
+
+## B. OMAC → ServoCtrl.I_Mode 映射（Normative）
+
+| OMAC Mode   | ServoCtrl.I_Mode                       |
+| ----------- | -------------------------------------- |
+| Production  | `SERVO_MODE_AUTO`                      |
+| Manual      | `SERVO_MODE_MANUAL`                    |
+| Maintenance | `SERVO_MODE_MANUAL`                    |
+| Invalid     | `SERVO_MODE_DISABLED`（或强制 LC_DISABLED） |
+
+---
+
+## C. 允许矩阵（核心）
+
+### C1) 通用硬规则（任何 OMAC 都成立）
+
+| 条件                       | 规则                                     |
+| ------------------------ | -------------------------------------- |
+| `LC != READY`            | **禁止一切运动**（Execute/Jog/Pos/Neg 均不得下发）  |
+| `LC = FAULT`             | 只允许 Fault 相关命令（Ack/Reset），禁止运动命令       |
+| `I_EnablePermit = FALSE` | 强制 `LC_DISABLED`，且 `Epos.EnableAxis=0` |
+| `SERVO_CMD_STOP`         | 若轴处于 READY 且在动，应随时有效（S1 清方向即停）         |
+
+---
+
+### C2) Production（自动域）
+
+> 自动域只允许：**ABS / REL / VEL**
+> 明确禁止：**JOG / INCJOG**
+
+| AxisLifecycle | 允许 AxisMotionMode  | 允许的 Cmd（概念级）                          | 备注           |
+| ------------- | ------------------ | ------------------------------------- | ------------ |
+| DISABLED      | `NONE`             | POWER_ON（若硬许可允许）                      | 仅允许请求上使能     |
+| ENABLING      | `NONE`             | （无）/STOP                              | 等待驱动反馈 ready |
+| READY         | `ABS/REL/VEL/NONE` | MOVE_ABS / MOVE_REL / MOVE_VEL / STOP | 运动允许         |
+| FAULT         | `NONE`             | ACK_FAULT / RESET                     | 禁止运动         |
+| RESETTING     | `NONE`             | （无）                                   | 等待故障清除       |
+
+**禁止项（Production + READY 下也禁止）：**
+
+* AxisMotionMode = `JOG` / `INCJOG`
+* 或任何 Jog/IncJog 触发命令
+
+---
+
+### C3) Manual（手动域）
+
+> 手动域允许：**JOG / INCJOG / ABS / REL / VEL**（全套手动测试）
+> 但仍受 Lifecycle gate 控制：必须 READY 才能动。
+
+| AxisLifecycle | 允许 AxisMotionMode             | 允许的 Cmd                                  | 备注       |
+| ------------- | ----------------------------- | ---------------------------------------- | -------- |
+| DISABLED      | `NONE`                        | POWER_ON                                 | 请求使能     |
+| ENABLING      | `NONE`                        | （无）/STOP                                 | 等待 ready |
+| READY         | `JOG/INCJOG/ABS/REL/VEL/NONE` | JOG（Level）/ INCJOG（Pulse）/ MOVE_* / STOP | 全手动      |
+| FAULT         | `NONE`                        | ACK_FAULT / RESET                        | 禁止运动     |
+| RESETTING     | `NONE`                        | （无）                                      | 等待故障清除   |
+
+---
+
+### C4) Maintenance（维护域）
+
+> 维护域通常与 Manual 相同，但你可以后续收紧（例如允许 JOG/INCJOG，但禁止 ABS/REL）。
+> 目前按你说的“Manual/Maintenance 下是手动模式”，先等价处理。
+
+| AxisLifecycle                     | 允许 AxisMotionMode | 允许的 Cmd  | 备注   |
+| --------------------------------- | ----------------- | -------- | ---- |
+| DISABLED/ENABLING/FAULT/RESETTING | 同 Manual          | 同 Manual | —    |
+| READY                             | 同 Manual          | 同 Manual | 默认等价 |
+
+---
+
+### C5) Invalid（无效域）
+
+> 无效域必须保证：**绝不运动**，只允许安全相关动作。
+
+| AxisLifecycle | 允许 AxisMotionMode | 允许的 Cmd             | 备注   |
+| ------------- | ----------------- | ------------------- | ---- |
+| ANY           | `NONE`            | STOP（可选）/ POWER_OFF | 强制禁动 |
+
+---
+
+## D. 三维“组合识别只看组合”的最终裁决规则（Normative）
+
+在任意扫描周期，ServoCtrl 的运动裁决必须遵循以下顺序（只写规则，不写实现）：
+
+1. **OMAC Gate**：先把 OMAC 映射为 `ServoCtrl.I_Mode`（Auto/Manual/Disabled）
+2. **Lifecycle Gate**：若 `LC != READY` → 运动输出全部禁止
+3. **AxisMotionMode Gate**：在允许的集合内才解析 `Cmd/CmdID`
+4. **Cmd Gate**：Cmd 只触发，不改变 AxisMotionMode（①已封板）
+5. **Stop Gate**：Stop 高优先级（在 READY 且运行时生效）
+
+---
+
+## E. 你现在立刻能用的“测试清单”（按这张表走）
+
+### 手动模式测试（OMAC=Manual 或 Maintenance）
+
+* 先把轴拉到 `LC_READY`
+* 再依次测试 AxisMotionMode：`JOG → INCJOG → VEL → ABS → REL`
+* 任意时刻触发 Fault：应跳到 `LC_FAULT` 且一切运动被禁止
+
+### 自动模式测试（OMAC=Production）
+
+* 必须 `LC_READY`
+* 只测试：`ABS / REL / VEL`
+* 确认：`JOG/INCJOG` 在 Production 下无论如何都不会动作
+
+---
+
+如果你确认这张三维表 OK，下一步进入 **③-A** 时我会按这张表把 ServoCtrl 的框架重构成三段：
+
+1. OMAC→I_Mode 映射（外部或内部）
+2. AxisLifecycle（③）
+3. Motion/Done（①+②，已封板）
+
+
