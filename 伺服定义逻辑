@@ -1,0 +1,157 @@
+下面把 **②（PhysicalDone / LogicalDone + Phase4 对接）**按“规范级”做一个**收敛总结**，你可以直接贴到仓库文档里。写完这份，我们再进③（PLCopen 风格 Enable/Fault/Reset）。
+
+---
+
+# Step② 设计规范总结 v1.0（Normative）
+
+## 1. 目的与范围
+
+Step②将伺服对象（ServoCtrl）从“能发动作”升级为**时间一致对象（time-consistent object）**，使其满足 Process Engine 的 **Freeze → Commit → Decide** 时间模型。
+
+本步只解决两件事：
+
+1. **PhysicalDone（物理完成）** 的统一语义
+2. **LogicalDone（逻辑完成）** 只能在 Process 的 Commit 点“记账确认”
+
+不在本步解决：
+
+* PLCopen 轴生命周期（Enable/Fault/Reset）完整状态机（留到③）
+* 自动工艺参数映射细节（方向/速度/曲线）
+* 超时、统计量等完善（可后续补）
+
+---
+
+## 2. 双完成模型（Dual Done Model）
+
+### 2.1 PhysicalDone（物理完成）
+
+**定义：** 由对象内部根据硬件/驱动反馈判定的“动作已达成”事实。
+
+* PhysicalDone 属于**物理域**，可以在 Pause 期间发生
+* PhysicalDone 不代表流程可以推进
+* PhysicalDone 是 LogicalDone 的必要条件之一
+
+**基准实现（当前版本）：**
+
+* 对 `AXIS_MOTION_ABS / REL`：`PhysicalDone := I_In_PositionOk`
+* 对 `AXIS_MOTION_HOME`（预留）：`PhysicalDone := I_In_Homed`
+* 对 `AXIS_MOTION_JOG / INCJOG / VEL`：默认不参与工艺 Done（`PhysicalDone := FALSE`）
+
+> 说明：速度模式 VEL 是否需要“完成”取决于工艺定义，本架构默认连续运动不产生 Done。
+
+---
+
+### 2.2 LogicalDone（逻辑完成）
+
+**定义：** Process 在**逻辑时间推进点（Commit）**对某个动作实例“记账确认”的完成事件。
+
+* LogicalDone 属于**逻辑域**，必须满足 Process 时间语义
+* LogicalDone 只允许在 Commit 点产生/锁存
+* LogicalDone 一旦锁存，必须保持，直到新动作实例到来（CmdID变化）
+
+**产生条件（Normative）：**
+在某一扫描周期内同时满足：
+
+1. `I_CommitPulse = TRUE`（来自 Process Phase4-B，单拍）
+2. `I_CommitCmdID == I_CmdID`（确认的是当前动作实例）
+3. `PhysicalDone = TRUE`
+
+则：
+
+* `Inner_LogicalDoneLatched := TRUE`
+* `Q_LogicalDone := TRUE`
+* `Q_Done := Q_LogicalDone`
+
+---
+
+## 3. Process ↔ ServoCtrl 对接接口（Normative）
+
+### 3.1 ServoCtrl 输入（新增）
+
+* `I_CommitPulse : BOOL`
+
+  * Process 在 Phase4-B Commit 那一拍输出 TRUE，其他扫描必须为 FALSE
+* `I_CommitCmdID : INT`
+
+  * Commit 那一拍携带要确认的动作 token（通常为本步当前 CmdID）
+
+### 3.2 ServoCtrl 输出（新增）
+
+* `Q_PhysicalDone : BOOL`
+* `Q_LogicalDone : BOOL`
+* `Q_Done : BOOL`
+
+  * 规范定义：`Q_Done == Q_LogicalDone`
+
+---
+
+## 4. 事件与锁存规则（Critical Invariants）
+
+### 4.1 新动作实例清零规则
+
+当出现“新动作实例”时，必须清除 Done 锁存：
+
+* 触发条件：`CmdID` 变化 **且** `Cmd` 属于“运动触发类”
+* 动作：
+
+  * `Inner_PhysicalDone := FALSE`
+  * `Inner_LogicalDoneLatched := FALSE`
+
+> 目的：防止 Power/Ack 等非运动命令误清 Done，也防止 Done 泄漏到下一次动作。
+
+### 4.2 Commit-only 规则（核心）
+
+* 在 `I_CommitPulse = FALSE` 的扫描周期内，ServoCtrl **不得**将 LogicalDone 置 TRUE
+* 即：**LogicalDone 不能由物理到位直接触发**
+
+### 4.3 Pause/Frozen 一致性（与 Phase4 对齐）
+
+* Process 冻结期间（Freeze Gate 生效）不得产生 CommitPulse
+* 因此对象在 Pause 期间即使 PhysicalDone 发生，也只能停留在 PhysicalDone，不能变为 LogicalDone
+* 恢复后在第一次合法 Commit 点再完成记账
+
+---
+
+## 5. Busy 与 Done 的关系（建议规范）
+
+### 5.1 离散动作（ABS/REL/HOME）
+
+* `Busy := NOT LogicalDone`
+* 逻辑含义：动作只有在 Commit 记账后才算“完成并退出 Busy”
+
+### 5.2 连续动作（VEL/JOG/INCJOG）
+
+* 不使用 LogicalDone 表示完成（默认）
+* Busy 定义为：
+
+  * VEL：`Busy := VelRunLatched`
+  * JOG：`Busy := (Jog1 XOR Jog2)` 或等效输入组合
+  * INCJOG：默认 `Busy := FALSE`（可选只在触发那一下亮）
+
+---
+
+## 6. Step②合规性检查清单（Checklist）
+
+* [ ] `LogicalDone` 只能在 `I_CommitPulse=TRUE` 的扫描周期内置位
+* [ ] `I_CommitCmdID` 必须与 `I_CmdID` 匹配才允许确认
+* [ ] `PhysicalDone` 可在 Pause 期间变化，但不会直接推进流程
+* [ ] 新动作实例到来会清除 Done 锁存（且仅对运动触发类命令清除）
+* [ ] `Q_Done == Q_LogicalDone`（语义一致）
+* [ ] Process Freeze 期间不产生 CommitPulse（系统层保证）
+
+---
+
+## 7. Step②产出（你现在已经完成的内容）
+
+你已经在 ServoCtrl 中加入并对齐了：
+
+* `AxisMotionMode`（①的组合解析输入）
+* `I_CommitPulse / I_CommitCmdID`（②对接 Phase4 Commit）
+* `Q_PhysicalDone / Q_LogicalDone`（②双完成输出）
+* `Inner_PhysicalDone / Inner_LogicalDoneLatched`（对象内部锁存）
+
+至此：
+
+> ServoCtrl 已满足 Process Engine 的“时间一致对象”要求，具备进入自动流程闭环的基础。
+
+
