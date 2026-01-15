@@ -1,0 +1,214 @@
+好，继续 **① AxisMotionMode 来源规范化**。
+下面这份是**“Cmd → AxisMotionMode → 触发语义”规范级解析表**，目标只有一个：
+
+> **任何调用方（HMI / Process）都不用猜 ServoCtrl 内部逻辑，
+> 只要按表填字段，就一定得到确定、可预测的行为。**
+
+这张表你可以直接放进：
+
+* `ARCHITECTURE.md`
+* `ServoCtrl_Interface.md`
+* 或作为 HMI / Process 的对接规范
+
+---
+
+# Cmd – AxisMotionMode 解析规范 v1.0（Normative）
+
+## 0. 设计总则（必须遵守）
+
+### G0.1 职责分离
+
+* `AxisMotionMode`：**声明“怎么动”**
+* `Cmd`：**声明“什么时候触发/控制”**
+* `CmdID`：**构造事件（Edge）**
+
+ServoCtrl **不得**根据 `Cmd` 隐式修改 `AxisMotionMode`。
+
+---
+
+### G0.2 单一解释原则
+
+在任意一个扫描周期内：
+
+* **只有一个 AxisMotionMode 生效**
+* Cmd 的解释 **只在该 AxisMotionMode 语义下成立**
+
+---
+
+## 1. AxisMotionMode 的来源（规范）
+
+| I_Mode   | AxisMotionMode 的填写者 | 填写方式           |
+| -------- | ------------------- | -------------- |
+| MANUAL   | HMI / 人工            | 人工选择（旋钮/按钮/下拉） |
+| AUTO     | Process / Step      | 工艺表给定          |
+| DISABLED | ServoCtrl           | 强制 NONE        |
+
+---
+
+## 2. Cmd 分类（规范）
+
+### 2.1 运动触发类（Motion Trigger）
+
+| Cmd                | 说明            |
+| ------------------ | ------------- |
+| SERVO_CMD_MOVE_ABS | 绝对定位触发        |
+| SERVO_CMD_MOVE_REL | 相对定位触发        |
+| SERVO_CMD_MOVE_VEL | 速度运行触发（Start） |
+
+### 2.2 运动控制类（Motion Control）
+
+| Cmd            | 说明       |
+| -------------- | -------- |
+| SERVO_CMD_STOP | 停止当前连续运动 |
+
+### 2.3 状态控制类（Lifecycle / Fault）
+
+| Cmd                 | 说明    |
+| ------------------- | ----- |
+| SERVO_CMD_POWER_ON  | 请求使能  |
+| SERVO_CMD_POWER_OFF | 请求下使能 |
+| SERVO_CMD_ACK_FAULT | 故障确认  |
+
+> ⚠️ 说明：
+> 状态控制类 Cmd **不参与 AxisMotionMode 的选择**。
+
+---
+
+## 3. Cmd × AxisMotionMode 解析矩阵（核心）
+
+> 读法：
+> 当 `(I_Mode, AxisMotionMode)` 已确定时，下列 Cmd 的语义如何解释。
+
+---
+
+### 3.1 MANUAL 模式
+
+| AxisMotionMode | Cmd                           | 触发语义                   | ServoCtrl 行为                    | 备注      |
+| -------------- | ----------------------------- | ---------------------- | ------------------------------- | ------- |
+| JOG            | —                             | Level                  | Jog1/Jog2 直接驱动                  | 不需要 Cmd |
+| INCJOG         | SERVO_CMD_JOG_POS_START / NEG | CmdID Edge → Pulse     | ModePos=8 + Jog1/Jog2 + Execute | Jog 子模式 |
+| ABS            | SERVO_CMD_MOVE_ABS            | CmdID Edge → Pulse(E1) | ModePos=2 + Execute             | 参数来自外部  |
+| REL            | SERVO_CMD_MOVE_REL            | CmdID Edge → Pulse(E1) | ModePos=1 + Execute             | —       |
+| VEL            | SERVO_CMD_MOVE_VEL            | CmdID Edge → Pulse(E1) | ModePos=3 + Execute(Start)      | 连续      |
+| VEL            | SERVO_CMD_STOP                | CmdID Edge             | 清 Pos/Neg，停止                    | S1      |
+
+#### 非法 Cmd（MANUAL）
+
+* 在 `AxisMotionMode ≠ 对应模式` 下收到 Motion Trigger Cmd
+  → **忽略执行 + 可置 `CMD_ERR_PARAM_MISMATCH`**
+
+---
+
+### 3.2 AUTO 模式
+
+| AxisMotionMode | Cmd                | 触发语义                   | ServoCtrl 行为               | 备注      |
+| -------------- | ------------------ | ---------------------- | -------------------------- | ------- |
+| ABS            | SERVO_CMD_MOVE_ABS | CmdID Edge → Pulse(E1) | ModePos=2 + Execute        | Step 驱动 |
+| REL            | SERVO_CMD_MOVE_REL | CmdID Edge → Pulse(E1) | ModePos=1 + Execute        | Step 驱动 |
+| VEL            | SERVO_CMD_MOVE_VEL | CmdID Edge → Pulse(E1) | ModePos=3 + Execute(Start) | 连续      |
+| VEL            | SERVO_CMD_STOP     | CmdID Edge             | 停止速度运行                     | S1      |
+
+#### 明确禁止（AUTO）
+
+* `AxisMotionMode = JOG / INCJOG`
+* 任意 Jog / IncJog Cmd
+  → **拒绝 + 诊断**
+
+---
+
+## 4. Stop 的全局规则（Normative）
+
+### S1：Stop 永远有效
+
+`SERVO_CMD_STOP`：
+
+* 与 `AxisMotionMode` 无关
+* 与 `I_Mode` 无关（只要 Enable）
+* 语义固定为：**清方向即停**
+
+---
+
+## 5. CmdID 使用规范（Normative）
+
+### C5.1 必须事件化
+
+* 任何 Motion Trigger Cmd **必须伴随 CmdID 变化**
+* 不得使用 Level 型 Cmd
+
+### C5.2 重复 CmdID = 无动作
+
+* 同一个 CmdID 在多扫内维持不变
+  → ServoCtrl **不得重复 Execute**
+
+---
+
+## 6. 非法组合的处理策略（推荐）
+
+| 情况                       | 建议行为                             |
+| ------------------------ | -------------------------------- |
+| Cmd 与 AxisMotionMode 不匹配 | 忽略 + `CMD_ERR_PARAM_MISMATCH`    |
+| AUTO 下使用 JOG / INCJOG    | 忽略 + `CMD_ERR_PERMISSION_DENIED` |
+| Enable 未允许却下发 Cmd        | 忽略 + `CMD_ERR_KERNEL_NOT_READY`  |
+
+---
+
+## 7. 示例（帮助 HMI / Process 理解）
+
+### 手动速度运行
+
+```text
+I_Mode = MANUAL
+AxisMotionMode = VEL
+Cmd = SERVO_CMD_MOVE_VEL
+CmdID++
+I_ManJogPos = TRUE   // 给方向
+```
+
+### 自动绝对定位
+
+```text
+I_Mode = AUTO
+AxisMotionMode = ABS
+Cmd = SERVO_CMD_MOVE_ABS
+CmdID++
+Position / Velocity / Over* 已预先写入
+```
+
+### 手动 IncJog
+
+```text
+I_Mode = MANUAL
+AxisMotionMode = INCJOG
+Cmd = SERVO_CMD_JOG_POS_START
+CmdID++
+```
+
+---
+
+## 8. ServoCtrl 的实现责任（明确边界）
+
+ServoCtrl **必须**：
+
+* 按 `(I_Mode, AxisMotionMode, Cmd, CmdID)` 解析
+* 不猜、不隐式切换 AxisMotionMode
+* 对非法组合给出一致的拒绝行为
+
+ServoCtrl **不负责**：
+
+* 决定 AxisMotionMode 的来源
+* 管理 HMI 的按钮逻辑
+* 解释工艺含义
+
+---
+
+## 下一步（自然过渡到 ②）
+
+当这张表确定后：
+
+* Process 可以明确知道：
+  **“我在 Step 表里应该填 AxisMotionMode=ABS + Cmd=MOVE_ABS”**
+* ServoCtrl 已具备**确定的事件输入语义**
+
+👉 下一步就可以非常干净地进入 **②：PhysicalDone / LogicalDone + Phase4 对接**。
+
+
