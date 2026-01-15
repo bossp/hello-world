@@ -1,0 +1,188 @@
+下面给你一份**“规范级组合映射表”**（可以直接贴进仓库当接口规范/实现约束），目的就是把：
+
+* **管理模式（谁控制）**：`ServoCtrl.Mode`（Auto/Manual/Disabled）
+* **运动模式（怎么动）**：`AxisMotionMode`
+* **驱动模式（怎么落到 FB284）**：`FB284.ModePos`
+* **触发语义（什么时候动）**：Level / Pulse / CmdID
+
+彻底拆开，同时规定“组合识别只看组合”。
+
+---
+
+# ServoCtrl × AxisMotionMode → FB284 映射规范 v1.0（Normative）
+
+## 0. 术语与域
+
+### 0.1 管理模式（Management Mode）
+
+`ServoCtrl.I_Mode ∈ { DISABLED, MANUAL, AUTO }`
+
+回答：**谁在控制**（系统/工艺/人工）。
+
+### 0.2 运动模式（Axis Motion Mode）
+
+`AxisMotionMode ∈ { NONE, JOG, INCJOG, ABS, REL, VEL }`
+
+回答：**怎么动**（运动学方式）。
+
+### 0.3 驱动模式（FB284 ModePos）
+
+`FB284.ModePos ∈ {0..8}`（本项目仅使用：0,1,2,3,7,8）
+
+回答：**驱动库如何解释输入信号**。
+
+### 0.4 事件语义（Trigger Semantics）
+
+* **Level**：保持型信号，撤销即停/即无效
+* **Pulse(E1)**：脉冲型信号，仅一拍有效
+* **CmdID Edge**：事件构造方式，`CmdID` 变化代表一个新命令实例
+
+---
+
+## 1. 最高优先级门控（Hard Gates）
+
+### G1：硬件使能许可门
+
+若 `I_EnablePermit = FALSE`：
+
+* `Epos.I_EnableAxis := FALSE`
+* `Epos.I_ModePos := 0`
+* 清所有动作位：`ExecuteMode/Jog1/Jog2/Positive/Negative := FALSE`
+* 对外 `Q_State := OFF`（或 `SERVO_STATE_IDLE`）
+
+> 该门控优先级 **高于一切模式/命令/运动请求**。
+
+### G2：软件禁用门
+
+若 `ServoCtrl.I_Mode = DISABLED`：
+
+* `Epos.I_EnableAxis := FALSE`
+* 同样清动作位并 `ModePos := 0`
+
+---
+
+## 2. 单点赋值规则（Write-Once Rules）
+
+### W1：EnableAxis 单点赋值
+
+`Epos.I_EnableAxis` 必须通过 `AllowEnable` 单点赋值：
+
+`AllowEnable := I_EnablePermit AND (I_Mode <> DISABLED) AND (其他许可门...)`
+
+### W2：ExecuteMode 脉冲语义（E1）
+
+`Epos.I_ExecuteMode` **必须默认 FALSE**，仅在“事件触发”扫描置 TRUE 一拍。
+
+---
+
+## 3. 组合映射总表（Normative）
+
+> 读法：当 `I_Mode` 与 `AxisMotionMode` 的组合成立时，ServoCtrl **必须**按表输出到 FB284。
+
+### 3.1 DISABLED 组合（全覆盖）
+
+| I_Mode   | AxisMotionMode | FB284 ModePos | Trigger | 输出约束                  |
+| -------- | -------------- | ------------: | ------- | --------------------- |
+| DISABLED | *ANY*          |             0 | —       | `EnableAxis=0`，清所有动作位 |
+
+---
+
+### 3.2 MANUAL 组合（规范实现）
+
+| I_Mode | AxisMotionMode | FB284 ModePos | Trigger                           | 方向信号源                 | 关键输出约束                                                                              |
+| ------ | -------------- | ------------: | --------------------------------- | --------------------- | ----------------------------------------------------------------------------------- |
+| MANUAL | NONE           |             0 | —                                 | —                     | 待命：不发任何动作                                                                           |
+| MANUAL | **JOG**        |         **7** | **Level**                         | **Jog1/Jog2**         | `Jog1=正`、`Jog2=反`；`ExecuteMode=0`                                                   |
+| MANUAL | **INCJOG**     |         **8** | **Pulse(E1)**                     | **Jog1/Jog2**         | 方向用 Jog1/Jog2；`ExecuteMode=1` 仅一拍                                                   |
+| MANUAL | **ABS**        |         **2** | **CmdID Edge → Pulse(E1)**        | —                     | `ExecuteMode=1` 一拍；位置/速度参数由外部给定                                                     |
+| MANUAL | **REL**        |         **1** | **CmdID Edge → Pulse(E1)**        | —                     | 同上                                                                                  |
+| MANUAL | **VEL**        |         **3** | **CmdID Edge → Pulse(E1)**（Start） | **Positive/Negative** | Start：`SERVO_CMD_MOVE_VEL+CmdID` 置 Execute 一拍；Stop：`SERVO_CMD_STOP+CmdID` 清 Pos/Neg |
+
+#### MANUAL 下的方向规定（Normative）
+
+* ModePos=7/8：方向 **必须**由 `Jog1/Jog2` 表示
+* ModePos=3：方向 **必须**由 `Positive/Negative` 表示
+
+---
+
+### 3.3 AUTO 组合（规范实现）
+
+| I_Mode | AxisMotionMode | FB284 ModePos | Trigger                           | 关键输出约束                                               |
+| ------ | -------------- | ------------: | --------------------------------- | ---------------------------------------------------- |
+| AUTO   | NONE           |             0 | —                                 | 不发动作                                                 |
+| AUTO   | **ABS**        |         **2** | **CmdID Edge → Pulse(E1)**        | `ExecuteMode` 仅一拍                                    |
+| AUTO   | **REL**        |         **1** | **CmdID Edge → Pulse(E1)**        | 同上                                                   |
+| AUTO   | **VEL**        |         **3** | **CmdID Edge → Pulse(E1)**（Start） | Stop 用 `SERVO_CMD_STOP` 清 Pos/Neg；运行参数可更新但不得清零 Over* |
+| AUTO   | JOG / INCJOG   |            禁止 | —                                 | **自动流程不得使用 JOG/INCJOG**（除非项目显式开放）                    |
+
+---
+
+## 4. 命令与组合的裁决规则（Normative）
+
+### R1：组合优先于命令
+
+ServoCtrl 必须先确定 `(I_Mode, AxisMotionMode)` 组合，再决定是否接受 `I_Cmd`。
+
+> 即：命令只是触发器，**组合决定“解释方式”。**
+
+### R2：手动连续 JOG 的抢占规则
+
+当 `I_Mode=MANUAL 且 AxisMotionMode=JOG` 时：
+
+* Jog 信号为 Level，优先级高于离散命令
+* 但不得覆盖 Stop（Stop 仍最高）
+
+### R3：INCJOG 为 JOG 子模式（设计确认）
+
+INCJOG 不定义为“独立运动命令”，它是 Jog 信号的采样模式：
+
+* **必须**以 Jog1/Jog2 的脉冲触发
+* **不得**设计为持续保持型，否则会变为重复增量
+
+---
+
+## 5. Stop 语义（Normative）
+
+### S1：Stop 清方向即停
+
+停止命令为：`SERVO_CMD_STOP`（事件型，CmdID Edge）
+
+Stop 处理必须：
+
+* 清 `Positive/Negative`
+* 清 `Jog1/Jog2`
+* 清任何连续动作锁存（如 `Inner_VelRunLatched`）
+* 不要求 Drive 支持额外 Stop 位（若未来需要，可扩展为 S2）
+
+---
+
+## 6. 参数保持规则（Normative）
+
+### P1：OverV/OverAcc/OverDec 属于运行参数
+
+除非显式更改（参数切换/配置更新），运行期间不得清零/被默认值覆盖。
+
+> ServoCtrl 不得在每扫“重置参数”为 0。
+
+---
+
+## 7. 合规性检查（Checklist）
+
+* [ ] `EnableAxis` 仅由 `AllowEnable` 单点赋值
+* [ ] `ExecuteMode` 默认 FALSE，仅事件触发一拍
+* [ ] ModePos=7/8 只用 Jog1/Jog2 表示方向
+* [ ] ModePos=3 只用 Positive/Negative 表示方向
+* [ ] Auto 不使用 JOG/INCJOG（除非显式允许）
+* [ ] Stop（SERVO_CMD_STOP）能打断所有连续动作（含速度运行）
+
+---
+
+## 8. 实施建议（Non-normative，但强烈推荐）
+
+* 将 `AxisMotionMode` 作为 ServoCtrl 的一个输入或由内部根据命令解析得到（两种都可）
+* 在 HMI 上显示“组合态”：`(I_Mode, AxisMotionMode, ModePos)`，诊断效率极高
+* 对速度运行使用 `Inner_VelRunLatched` 锁存，避免每扫误触发
+
+---
+
+
