@@ -1,0 +1,21 @@
+你现在该怎么定“规划”，不影响先跑起来？
+
+我建议你定一个明确路线图（不写代码也能定规范）：
+
+S2（现在重构目标）
+
+轴/缸对象真源（Obj.I/Obj.Q/HW + FB Inner）
+
+同步：Latch+Stamp 做成 Action（新能力）
+
+Loop/Jump：先保留 Phase4 旧字段（兼容）
+
+S3（下一阶段）
+
+引入 TT_FLOW_JUMP（Action 跳转），逐步替换旧 LoopId
+
+Group 仍保留旧字段
+
+S4（再下一阶段）
+
+Group 也变成控制流 Action（IssueGroup/WaitGroup）
