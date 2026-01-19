@@ -19,3 +19,15 @@ Group 仍保留旧字段
 S4（再下一阶段）
 
 Group 也变成控制流 Action（IssueGroup/WaitGroup）
+
+Process
+  └─ 写 ServoCtrl.I
+ServoFB
+  ├─ 读 ServoCtrl.I
+  ├─ 读 Axis (硬件真源)
+  ├─ 读 Param[]
+  └─ 写 ServoCtrl.Q
+Axis
+  └─ 包含 EPOS_Interface + EnablePermit + 硬件诊断
+Param[]
+  └─ 纯参数真源（UDT_ServoParam_S2）
