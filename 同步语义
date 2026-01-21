@@ -1,0 +1,296 @@
+下面这一节可以直接塞进你现有的 **Process_v2 规范文档**里（对应你贴的这版 `FB_Process_V2`），用于把 **Barrier / Token / Latch** 三种同步语义“显性化”。
+（注意：这是**规范**，不是建议；措辞按 hard-constraint 写。）
+
+---
+
+# 9.x 同步语义规范：Barrier / Token / Latch（Process_v2）
+
+## 9.x.1 目的与范围
+
+本章节定义 Process_v2 的**同步语义模型**，用于统一解释以下两类“等待/推进”行为：
+
+1. **工艺内部同步**：同一 Step 内多个 Action 的启动与等待（Cylinder / Servo）。
+2. **工艺推进同步**：Step 间推进、循环回跳、暂停确认等推进约束（Phase4）。
+
+本章节只约束 **Process 引擎内部时序语义**。
+**Action 不是同步对象**：Action 描述命令；同步描述 Process 如何推进时间与步号。
+
+---
+
+## 9.x.2 基本定义
+
+### 9.x.2.1 Action（动作）
+
+Action 是 Step 内对外部控制对象的一次命令描述，来源于：
+
+* `Step[StepNo].Actions[idx]` 且 `Enable=TRUE`
+
+Action 的目标对象由 `TargetType` 确定：
+
+* `TargetType=1`：Cylinder（`Cyl[tgt]`）
+* `TargetType=2`：Servo（`g_Servo.ServoCtrl[tgt]`）
+
+**硬约束：**
+
+* Process 仅在 Phase1 下发命令（Issue），且每个 Step 的 Issue 必须只发生一次（由 `Inner_CmdIssued` 约束）。
+* Process 的同步语义不改变 Action 的定义与字段，仅作用于“等待与推进”。
+
+---
+
+### 9.x.2.2 Wait Object（等待对象）
+
+Wait Object 是 Step 内需要参与同步判定的对象集合，定义为：
+
+* `Step[StepNo].Actions[idx].Wait = TRUE` 的动作目标对象
+
+**硬约束：**
+
+* 若本 Step 中不存在任何 Wait Object，则 Phase2 的 `doneCond` 必须视为 TRUE（即 Step 无等待同步约束）。
+
+---
+
+### 9.x.2.3 时间推进（Time Advance）
+
+Process 的“时间推进”包含以下状态变量的改变：
+
+* `Inner_StepNo`、`Inner_Phase`、`Inner_LoopCnt[]`、`Inner_ActiveWaitGroup`、`Inner_AutoCmdID`
+
+**硬约束：**
+
+* 一旦进入冻结（Latch Freeze），**同一扫描周期内**禁止任何时间推进（详见 9.x.5）。
+
+---
+
+## 9.x.3 Barrier 同步语义（屏障：All-of）
+
+### 9.x.3.1 定义
+
+Barrier 同步：Process 必须等待 **本同步集合内所有 Wait Object** 完成后，才允许推进到下一阶段。
+
+在当前实现中，Barrier 同步发生于：
+
+* **Phase2（Wait）**，当 `WaitGroupMode=0`
+
+### 9.x.3.2 完成条件（Done Condition）
+
+对每个 Wait Object：
+
+* Cylinder：完成条件为 `Cyl[tgt].Q_Done = TRUE`
+* Servo：完成条件为 `g_Servo.ServoCtrl[tgt].Q_LogicalDone = TRUE`
+
+Barrier 完成条件：
+
+* `doneCond = TRUE` 当且仅当 **所有参与 Barrier 的 Wait Object 都满足各自完成条件**
+
+### 9.x.3.3 Servo 的提交语义（Barrier 内嵌 Commit）
+
+当 Servo 参与 Barrier 同步时，必须遵守：
+
+* 若 `Q_PhysicalDone = TRUE` 且 `Q_LogicalDone = FALSE`，Process 必须自动触发提交，使其进入逻辑完成。
+
+**硬约束（单拍提交）：**
+
+* Process 每扫描周期必须先清 `I_CommitPulse := FALSE`
+* 满足提交条件时：
+
+  * `I_CommitCmdID := Inner_AutoCmdID`
+  * `I_CommitPulse := TRUE`（仅当扫有效）
+* Barrier 判定仅以 `Q_LogicalDone` 为准，不得以 `Q_PhysicalDone` 直接视为完成。
+
+---
+
+## 9.x.4 Token 同步语义（令牌/计数：Condition-of）
+
+Token 同步：推进依赖于“计数/组号/次数”等离散条件满足，而不是等待所有对象到齐。
+
+Token 同步在当前实现中包含两类：
+
+1. **WaitGroup Token（Phase2 分组等待）**
+2. **Loop Token（Phase4 循环计数）**
+
+---
+
+### 9.x.4.1 WaitGroup Token（分组同步）
+
+#### a) 启用条件
+
+当 `Step[StepNo].WaitGroupMode <> 0` 时启用分组同步，组推进由：
+
+* `Inner_ActiveWaitGroup`（从 1 开始）
+* `Actions[idx].WaitGroup`（0 归一为 1）
+
+#### b) 组内同步规则
+
+在任一扫描周期中，仅对“当前组”的 Wait Object 参与 `doneCond` 计算：
+
+* 当前组号 `wg = (Inner_ActiveWaitGroup=0)? 1 : Inner_ActiveWaitGroup`
+* 若 Action.WaitGroup=0，则归一到 1
+
+只有当：
+
+* `Action.Wait=TRUE` 且 `Action.WaitGroup == wg`（或归一后相等）
+
+该对象才参与本扫描的 `doneCond`。
+
+#### c) 推进规则（单步推进）
+
+当且仅当当前组 `doneCond=TRUE` 时：
+
+* 若 `Inner_ActiveWaitGroup < (WaitGroupCount + 1)`：
+
+  * `Inner_ActiveWaitGroup := Inner_ActiveWaitGroup + 1`
+  * **必须立即 RETURN**（同一扫描不得穿透进入下一阶段）
+* 否则：
+
+  * 组同步完成，允许进入 Phase3
+
+**硬约束：**
+
+* 分组推进每扫描最多推进一个组号，且推进后必须 RETURN，避免“同一扫描多组穿透”。
+
+---
+
+### 9.x.4.2 Loop Token（循环计数同步）
+
+#### a) 启用条件
+
+当满足以下条件时启用循环计数：
+
+* `LoopId ∈ [1..LoopIdMax]`
+* `RepeatTotal > 1`
+
+Loop 计数槽位：
+
+* `idx = LoopId - 1`
+* 计数器为 `Inner_LoopCnt[idx]`
+
+#### b) Commit 规则（每迭代+1且仅一次）
+
+在 Phase4 中，若未处于冻结（Latch Freeze），每次进入 Advance 的一个迭代提交：
+
+* `Inner_LoopCnt[idx] := Inner_LoopCnt[idx] + 1`
+
+**硬约束：**
+
+* 每次迭代只允许 +1 一次
+* 冻结期间不得自增（详见 9.x.5）
+
+#### c) 回跳/结束规则
+
+* 若 `Inner_LoopCnt[idx] < RepeatTotal`：
+
+  * 若 `JumpStepNo > 0` 则 `Inner_StepNo := JumpStepNo`
+  * `Inner_AutoCmdID := Inner_AutoCmdID + 1`
+  * `Inner_Phase := 1`
+  * 清 `Inner_CmdIssued/Inner_DoneSeen/Inner_ActiveWaitGroup`
+  * RETURN
+* 否则（达到次数）：
+
+  * `Inner_LoopCnt[idx] := 0`
+  * 落入 Normal Next Step 流程
+
+---
+
+## 9.x.5 Latch 同步语义（锁存冻结：Freeze + Confirm Release）
+
+Latch 同步用于实现“暂停/确认后继续”的冻结点。
+当前实现中 Latch 同步发生于：
+
+* **Phase4（Advance）**，由 `Inner_PauseArmed[idx]` 控制
+* 释放条件为 `ConfirmR`（确认上升沿）
+
+---
+
+### 9.x.5.1 上膛（Arm）
+
+当满足以下条件时，Latch 必须上膛：
+
+* `PauseEvery > 0`
+* 且 `Inner_LoopCnt[idx] MOD PauseEvery = 0`
+
+上膛动作：
+
+* `Inner_PauseArmed[idx] := TRUE`
+
+**硬约束：**
+
+* 上膛发生在 Commit 之后（即 LoopCnt 已更新的迭代点）。
+* 上膛本扫描不立即冻结；冻结在下一次 Phase4 进入时优先生效（Deferred Freeze）。
+
+---
+
+### 9.x.5.2 冻结优先级（Freeze Gate Absolute Priority）
+
+当 `Inner_PauseArmed[idx] = TRUE` 时，Process 必须进入冻结状态：
+
+* `Proc_State := 500`（Pause）
+
+冻结规则：
+
+* 若 `ConfirmR = FALSE`：
+
+  * **必须立即 RETURN**
+  * 且禁止任何时间推进（StepNo/Phase/LoopCnt/ActiveWaitGroup/CmdID 等不得改变）
+* 若 `ConfirmR = TRUE`：
+
+  * 释放冻结：
+
+    * `Inner_PauseArmed[idx] := FALSE`
+    * 允许本扫描继续执行后续 Commit/Decide/Next
+
+**硬约束：**
+
+* Freeze Gate 的判定必须位于 Phase4 的最前面，且在任何 LoopCnt 自增、StepNo 变更之前执行。
+* 冻结期间不得推进时间，不得修改任何推进相关状态变量。
+
+---
+
+## 9.x.6 三种同步的组合顺序（Phase 映射）
+
+### 9.x.6.1 Phase2（Wait）
+
+* `WaitGroupMode=0`：Barrier
+* `WaitGroupMode≠0`：Token（组号） + 组内 Barrier（对当前组对象）
+
+Servo 自动 Commit 属于 Barrier/Token 内嵌机制，最终完成判据统一为 `Q_LogicalDone`。
+
+### 9.x.6.2 Phase4（Advance）
+
+执行顺序必须严格为：
+
+1. **Latch Freeze Gate（绝对优先）**
+2. **Token Commit（LoopCnt + 1）**
+3. **Decide：**
+
+   * Latch Arm（PauseEvery 上膛）
+   * Token Condition（RepeatTotal / JumpStepNo）
+   * Normal Next Step
+
+---
+
+## 9.x.7 禁止写法（Forbidden Patterns）
+
+以下写法为硬禁止：
+
+1. **将 Wait 建模为 ActionType**（例如 TargetType=Wait）
+
+   * 同步语义必须由 Process 内部对 Action 状态进行协调，不得下发“等待命令”。
+
+2. **冻结期间推进时间**
+
+   * 任何 Freeze Gate 返回前修改 StepNo/Phase/LoopCnt/CmdID/ActiveWaitGroup 均为违规。
+
+3. **Servo 以 Q_PhysicalDone 视为完成**
+
+   * 必须通过 CommitPulse 进入 `Q_LogicalDone` 才算完成。
+
+4. **WaitGroup 同一扫描推进多个组**
+
+   * 推进组号后必须 RETURN，避免穿透造成隐含竞态。
+
+---
+
+这一节写完后，你的文档里“等待/同步”就会非常清晰：
+**Barrier** 解释 “等齐”、**Token** 解释 “条件/次数/组推进”、**Latch** 解释 “冻结确认”。
+
+如果你还想更工程化一点（但仍不改代码），我可以再给你补一个小节：把你现有变量（`doneCond/hasWaitObj/Inner_ActiveWaitGroup/Inner_LoopCnt/Inner_PauseArmed/ConfirmR`）逐个映射到这三类同步模型，作为“实现索引表”。
