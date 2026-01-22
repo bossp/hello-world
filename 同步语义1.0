@@ -1,0 +1,260 @@
+好，v1.0 规范更新为最终版：加入 **ExtPubReq/ExtPubEn（外部发布源）**，并明确 **边沿发布 + CmdPublish 优先**。下面给你一份可直接落库的 **SyncObject 规范 v1.0（Final）**。
+
+---
+
+# SyncObject 规范 v1.0（Final）
+
+## 0. 目的与范围
+
+SyncObject 用于跨 Process 的同步协调，提供两类语义：
+
+* **PUBLISH**：发布一次性事件（Token+1）
+* **WAIT**：等待一次性事件发生（Token 变化），可选择消费（更新本地游标）
+
+并扩展支持：
+
+* **Ext Publish**：由外部实际信号或工程组合逻辑触发发布（ExtPubReq/ExtPubEn）
+
+SyncObject 必须保证：
+
+1. **一次性**：不允许 Bool 粘连穿透；使用 Token 化事件
+2. **scan-safe**：同一扫内发布/等待不应因读写顺序导致误判
+3. **对象自治**：等待计时、报警锁存、消费游标、外部边沿识别都在对象内部
+4. **Process 纯调度**：Process 只发 Cmd / 等 Done / 处理 Alarm，不实现 token 逻辑
+
+---
+
+## 1. SyncBus（全局同步总线）
+
+### 1.1 全局 DB
+
+`g_SyncBus.Point[1..N] : ARRAY[1..N] OF UDT_SyncPoint`
+
+### 1.2 UDT_SyncPoint（字段规范）
+
+* `PubToken : DInt`
+  发布计数器，发布一次 +1
+* `Valid : Bool`
+  点是否启用/有效（工程开关）
+* `LastPubCmdID : Int`（推荐）
+  最近一次发布的 CmdID/来源，用于诊断
+* `Diag : DInt`（可选）
+  诊断/扩展
+
+**外部发布源（新增）**
+
+* `ExtPubReq : Bool`
+  外部发布请求（来自真实对象事件或人工组合逻辑）
+* `ExtPubEn : Bool`
+  外部发布使能（=TRUE 才允许 ExtPubReq 生效）
+
+### 1.3 写权限规则（硬约束）
+
+* 发布方允许写：`PubToken/LastPubCmdID/Diag`
+* 等待方只读总线点
+* **禁止**消费者写回总线表示“已读/已完成”
+* `ExtPubReq/ExtPubEn` 允许由工程逻辑写入，但建议遵循“单写者原则”（见 9）
+
+---
+
+## 2. 接口规范（单 FB + 数组 + 索引）
+
+> 采用：一个 FB 实例 + `VAR_IN_OUT` 传入 SyncBus 数组 + `I_Idx` 指向某点。
+
+### 2.1 Inputs
+
+* `I_EnablePermit : Bool`
+* `I_ModeAuto : Bool`（ModeAuto=FALSE 时手动优先完全接管，见 6）
+* `I_Cmd : USInt`（SYNC_CMD_*）
+* `I_CmdID : DInt`（CmdID 变化触发）
+* `I_Idx : UInt`（1..N）
+* `I_Consume : Bool`（WAIT 成功后消费，默认 TRUE）
+* `I_Timeout : Time`（WAIT 超时，T#0ms 表示不超时）
+* `I_ResetAlarm : Bool`（上升沿清锁存）
+* `I_NoFeedbackAlarmEnable : Bool`（可选：非法 idx/禁用点是否报警，默认 TRUE）
+
+### 2.2 Outputs
+
+* `Q_Busy : Bool`
+* `Q_Done : Bool`（一次性 Done：保持到下一次 CmdID 变化）
+* `Q_Alarm : Bool`（锁存）
+* `Q_LastError : Int`
+* `Q_State : USInt`
+* `Q_LifeCnt : DInt`
+* `Q_LastTime_ms : DInt`
+* `Q_AvgTime_ms : DInt`
+* `Q_LastSeenToken : DInt`（可选诊断输出）
+* `Q_CurToken : DInt`（可选诊断输出）
+
+### 2.3 InOut
+
+* `SyncBus : ARRAY[1..N] OF UDT_SyncPoint`
+
+---
+
+## 3. 命令与状态枚举
+
+### 3.1 Cmd（USInt）
+
+* `SYNC_CMD_NONE = 0`
+* `SYNC_CMD_PUBLISH = 1`
+* `SYNC_CMD_WAIT = 2`
+* `SYNC_CMD_CLEAR = 3`（对齐消费游标/清 Done）
+
+### 3.2 State（USInt）
+
+* `IDLE = 0`
+* `EXEC_PUBLISH = 10`
+* `WAITING = 20`
+* `DONE = 30`
+* `ERROR = 40`
+
+### 3.3 Error（Int）
+
+* `ERR_NONE = 0`
+* `ERR_INVALID_IDX = 1`
+* `ERR_POINT_DISABLED = 2`
+* `ERR_TIMEOUT = 3`
+* `ERR_CMD_CONFLICT = 4`（可选）
+
+---
+
+## 4. 核心行为（Formal Semantics）
+
+### 4.1 Cmd 事件化（统一规则）
+
+* `CmdNew := (I_CmdID <> Inner_CmdID_Old)`
+* 只有 CmdNew=TRUE 才允许启动命令 / 执行一次发布 / CLEAR / DONE→IDLE
+
+### 4.2 点合法性与有效性
+
+命令启动时检查：
+
+* idx ∉ [1..N] → 依据 `I_NoFeedbackAlarmEnable` 决定是否报警
+* `SyncBus[idx].Valid=FALSE` → 依据 `I_NoFeedbackAlarmEnable` 决定是否报警
+
+### 4.3 PUBLISH（CmdPublish）语义
+
+触发条件：`CmdNew AND I_Cmd=SYNC_CMD_PUBLISH` 且点有效
+
+动作：
+
+* `SyncBus[idx].PubToken++`
+* `SyncBus[idx].LastPubCmdID := I_CmdID`（推荐）
+* 进入 DONE（1 扫完成）
+* 统计量：LifeCnt++，记录耗时
+
+### 4.4 WAIT 语义（Token 差值 + 本地游标）
+
+对象内部必须维护：
+
+* `Inner_LastSeenToken[1..N] : DInt`（每点一个消费游标）
+* WAIT 成功条件：`SyncBus[idx].PubToken <> Inner_LastSeenToken[idx]`
+* 若 `I_Consume=TRUE`：成功时 `Inner_LastSeenToken[idx] := SyncBus[idx].PubToken`
+* 超时：进入 ERROR，报警锁存
+
+### 4.5 CLEAR 语义
+
+触发条件：`CmdNew AND I_Cmd=SYNC_CMD_CLEAR` 且 idx 有效
+
+动作：
+
+* `Inner_LastSeenToken[idx] := SyncBus[idx].PubToken`
+* 清 Done / 停止计时 / 回到 IDLE（不强制 Done）
+
+---
+
+## 5. 外部发布源（ExtPubReq/ExtPubEn）（新增，Final）
+
+### 5.1 目标
+
+允许 Token 发布与真实对象事件或人工组合逻辑关联，而不污染 Process 工艺表。
+
+### 5.2 边沿发布（硬约束）
+
+Ext 发布必须按 **边沿**触发，而不是电平触发。
+
+对象内部必须维护：
+
+* `Inner_ExtPubReqOld[1..N] : Bool`
+
+边沿定义：
+
+* `ExtEdge := SyncBus[idx].ExtPubEn AND SyncBus[idx].ExtPubReq AND NOT Inner_ExtPubReqOld[idx]`
+
+### 5.3 发布优先级（硬约束）
+
+**CmdPublish 优先**：
+
+* 若同一扫内 `CmdPublish` 已触发并完成发布，则 **不再因 ExtEdge 额外发布一次**
+* ExtEdge 只在 CmdPublish 未发生时生效
+
+（避免同一扫 token 跳变 +2，调试更可控）
+
+### 5.4 Ext 发布的生效条件
+
+* 仅当 idx 合法且 `SyncBus[idx].Valid=TRUE` 时允许 Ext 发布
+* 若点禁用/索引非法：
+
+  * `I_NoFeedbackAlarmEnable=TRUE` 时可报警（工程策略）
+
+### 5.5 Ext 发布与 WAIT 的关系
+
+* WAIT 只看 `PubToken` 差值，不直接看 `ExtPubReq`
+* 任何使用 `ExtPubReq` 作为 WAIT 条件的写法均视为违规（会引入粘连）
+
+---
+
+## 6. 手动优先（ModeAuto=FALSE 完全接管）
+
+当 `I_ModeAuto = FALSE` 时：
+
+* 对象不得执行 WAIT / CmdPublish / ExtPublish（默认 v1.0 安全策略）
+* 输出：
+
+  * `Q_Busy=FALSE`
+  * `Q_Done=FALSE`
+  * 定时器停止
+* 报警复位仍有效（ResetAlarm 上升沿清锁存）
+
+> 若后续需要“手动联调允许发布”，必须显式增加 `I_ManualPermit`，v1.0 不包含。
+
+---
+
+## 7. 报警语义（AlarmLatched）
+
+* 报警必须锁存：`Q_Alarm = Inner_AlarmLatched`
+* `ResetAlarm` 上升沿清除：
+
+  * `Inner_AlarmLatched := FALSE`
+  * `Q_LastError := ERR_NONE`
+  * 状态从 ERROR 回到 IDLE
+* 报警来源允许：
+
+  1. 非法 idx
+  2. 点禁用
+  3. WAIT 超时
+  4. 命令冲突（可选）
+
+---
+
+## 8. 统计量口径
+
+* `LifeCnt`：每次成功完成 Publish 或 Wait +1（ExtPublish 成功也计入）
+* `LastTime_ms`：命令启动（CmdNew）到 DONE 的耗时
+* `AvgTime_ms`：整数平均（递推或累积/计数，避免溢出）
+
+---
+
+## 9. 工程约束与推荐
+
+* **单写者原则（强烈推荐）**：每个 SyncPoint 的 `ExtPubReq` 最好只有一个写入源
+* `ExtPubReq` 推荐由工程逻辑生成 **脉冲**（更可读、更易诊断）
+* `Valid`（存在/禁用）与 `ExtPubEn`（外部源使能）职责分离，不要混用
+* 不同机型差异通过“组合逻辑写 ExtPubReq”解决，SyncObject 与 Process 不改
+
+---
+
+这就是 1) 的最终版规范。
+
+如果你点头，我们再对齐 2)：**Process 中接入 B（TargetType=SYNC 的最小增量改动清单）**——我会按“一个 FB + SyncBus 数组 + idx”的形式写清楚 Step 里需要新增哪些字段/映射，且保证对现有 Servo/Cyl 调度路径是最小侵入。
