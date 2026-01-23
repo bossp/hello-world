@@ -1,0 +1,153 @@
+好，那我把它**收敛成一段可直接入库的规范文本**。这版是“工程约束级”的，不是说明书口吻，你可以直接放到你现在的 **Process / SyncObject 设计规范**里。
+
+---
+
+# SyncObject 行为语义规范 · I_Consume（v1.0）
+
+## 1. 定义
+
+**I_Consume 用于定义同步等待（WAIT）在成功完成后，是否“消费”当前同步事件。**
+
+* I_Consume **仅作用于 WAIT 行为**
+* 不影响：
+
+  * Publish 行为
+  * Token 的产生方式
+  * 外部发布（ExtPubReq）
+
+---
+
+## 2. 基础模型
+
+每个同步点（SyncIdx）存在以下三个核心量：
+
+1. **PubToken（SyncBus[Idx].PubToken）**
+
+   * 全局事件计数器
+   * 每次 Publish（命令或外部）递增
+   * 只增不减
+
+2. **LastSeenToken（Inner_LastSeenToken[Idx]）**
+
+   * 当前等待者记录的“已确认事件基线”
+   * 私有状态，仅属于该 SyncObject 实例
+
+3. **WAIT 完成判定条件**
+
+```text
+PubToken ≠ LastSeenToken  ⇒  同步事件已发生
+```
+
+---
+
+## 3. I_Consume = TRUE（事件消费型，同步默认模式）
+
+### 3.1 语义
+
+> WAIT 成功后，**本次同步事件被标记为已消费**，后续 WAIT 必须等待新的事件发生。
+
+### 3.2 行为规则
+
+* 当 WAIT 成功时：
+
+```scl
+Inner_LastSeenToken[Idx] := SyncBus[Idx].PubToken;
+```
+
+### 3.3 结果
+
+* 后续 WAIT：
+
+  * 若 PubToken 未变化 → WAIT 不完成
+  * 必须等待新的 Publish
+
+### 3.4 典型适用场景
+
+* 工艺节拍同步
+* 一次性交互确认
+* PLC ↔ 第三方设备命令-响应
+* 串行流程中的“只用一次”事件
+
+### 3.5 工程约定
+
+* **I_Consume = TRUE 为默认值**
+* 未显式配置时，WAIT 采用消费型语义
+
+---
+
+## 4. I_Consume = FALSE（事件观察型 / Sticky 模式）
+
+### 4.1 语义
+
+> WAIT 仅判断事件是否发生过，不修改基线，事件可被多次观察。
+
+### 4.2 行为规则
+
+* 当 WAIT 成功时：
+
+```scl
+// 不更新 Inner_LastSeenToken
+```
+
+### 4.3 结果
+
+* 后续 WAIT：
+
+  * 若 PubToken 未变化 → WAIT 仍立即完成
+  * 事件呈“粘性成立”状态
+
+### 4.4 典型适用场景
+
+* 多流程 / 多 Step 共享同一事件
+* 广播型同步
+* 状态类条件（如“设备已准备好”）
+* 不希望等待者之间产生竞争或抢占
+
+---
+
+## 5. 禁止与约束
+
+### 5.1 禁止将 Consume 语义放入 SyncBus
+
+* Consume 是 **等待者行为**
+* SyncBus 仅描述 **事件事实**
+* 不得在 SyncBus 中存储任何消费状态
+
+### 5.2 不得在 Publish 阶段修改 LastSeenToken
+
+* LastSeenToken 只允许在：
+
+  * CLEAR
+  * WAIT + Consume = TRUE
+    时修改
+
+---
+
+## 6. 与 Process / Action 的接口约定
+
+* I_Consume 由 **Action 层配置**
+* 不得由 SyncObject 内部策略隐式决定
+* 不得使用全局参数覆盖 Action 的 Consume 行为
+
+```text
+Consume 是工艺策略，不是同步点属性
+```
+
+---
+
+## 7. 设计原则总结
+
+* **PubToken = 事实**
+* **LastSeenToken = 等待者视角**
+* **I_Consume = 事件使用策略**
+
+三者必须严格分离，否则同步语义将不可组合、不可复用。
+
+---
+
+如果你愿意，下一步我可以继续帮你补全两段同级规范：
+
+* 《SyncObject 行为语义规范 · Publish / Wait / Clear》
+* 《Process 中 SyncAction 的调度与 Done 判定规则》
+
+你现在这套已经是**可以长期演进的同步模型**了，接下来就是把 Process 写得同样“干净”。
