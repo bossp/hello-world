@@ -1,0 +1,157 @@
+下面是一页纸版 **《SyncBus 信号语义与写入责任表（S2 工程定稿）》**，按你现在已经跑通的版本写，后续照这个做就不会再掉坑。
+
+---
+
+# SyncBus 信号语义与写入责任表（S2 工程定稿）
+
+## 0. 总原则
+
+1. **SyncBus 是 InOut 共享总线（DB 变量）**
+   → 默认“保持语义”：**本周期没人写，它就保持上周期值**。
+   → 不允许假设“自己会变回 FALSE”。
+
+2. **Step 推进唯一依据：`DonePulse`**
+   → `Busy/State` 只用于诊断，不参与推进判定。
+   → `Alarm=TRUE` 作为最小侵入策略：Process 直接停机。
+
+3. **声明型信号必须包含“撤销声明”**
+   → `ReqWait/ReqPublish` 必须明确谁负责清零（写 FALSE）。
+
+---
+
+## 1) 字段语义表（每个字段一行）
+
+### A. 外部发布相关
+
+* **ExtPubEn (Bool)**
+  作用：允许外部发布通道。
+  写入责任：外部/HMI/上位。
+  保持：是（外部负责）。
+
+* **ExtPubReq (Bool)**
+  作用：外部发布请求（电平型）。
+  写入责任：外部。
+  清零责任：外部（Broker 不强清）。
+  说明：外部若只打一拍，也可；若保持电平，则需配合 ExtPubCmdID 变化避免重复发布。
+
+* **ExtPubCmdID (DInt)**
+  作用：外部事件号，**变化触发**一次发布。
+  写入责任：外部。
+
+---
+
+### B. 流程发布相关
+
+* **ReqPublish (Bool)**
+  作用：Process 发布请求（声明型，电平）。
+  写入责任：Process（Phase1 发起）。
+  清零责任：**Broker（每周期清）**。
+  规范：Process 可打一拍或保持；Broker 会清，保证邮箱语义。
+
+* **PubCmdID (DInt)**
+  作用：流程事件号（变化触发发布）。
+  写入责任：Process。
+  规则：不得用 0 作为有效事件号（避免默认值误触发）。
+
+* **LastPubCmdID (DInt)**
+  作用：Broker 内部去重记录（防重复发布）。
+  写入责任：Broker。
+
+* **PubToken (DInt)**
+  作用：Broker 发布计数 token（每次接纳发布 token++）。
+  写入责任：Broker。
+  说明：邮箱语义的“信封编号”。
+
+---
+
+### C. 等待/消费相关（核心）
+
+* **ReqWait (Bool)**
+  作用：Process 等待声明（电平型）。
+  写入责任：Process（Phase2 等待期间）。
+  **清零责任：Process（放行后撤销声明）**。
+  关键规则：
+
+  * 等待期间必须保持 `ReqWait=TRUE`，否则可能丢放行；
+  * **看到 `DonePulse=TRUE` 的当拍必须撤销：`ReqWait:=FALSE`**；
+  * 不允许假设“离开 Step 自己回落”。
+
+* **Timeout (Time)**
+  作用：等待超时设定。
+  写入责任：Process（Phase1 或 Phase2 保持写入均可，建议等待期间保持与 Action 一致）。
+  规则：`T#0ms` 表示禁用超时。
+
+* **LastSeenToken (DInt)**
+  作用：消费进度（已消费到哪个 token）。
+  写入责任：Broker（当 Wait 放行时更新为 PubToken）。
+  说明：`LastSeenToken < PubToken` 表示有新发布未消费。
+
+* **DonePulse (Bool)**
+  作用：放行脉冲（一拍）。
+  写入责任：Broker。
+  时序规则：Broker 每周期先清零，再根据 `ReqWait` 与 token 条件打一拍。
+  Process 规则：推进条件 **只认 DonePulse**。
+
+* **Busy (Bool)** / **State (USInt)**
+  作用：诊断：等待中/空闲/报警等。
+  写入责任：Broker。
+  规则：Process 不得用 Busy/State 推进 Step（只诊断显示）。
+
+---
+
+### D. 报警/诊断
+
+* **Alarm (Bool)**、**LastError (Int)**
+  作用：等待超时等报警。
+  写入责任：Broker。
+  清零策略：按你当前 Broker 实现（离开等待自动清，或未来改为 ResetAlarm 上升沿清）。
+  Process 策略：`Alarm=TRUE` → 立即停机（最小侵入）。
+
+* **Valid (Bool)**
+  作用：点使能门控。
+  写入责任：工程配置/HMI。
+  规则：Valid=FALSE 时 Broker 不处理该点；Process 若遇到 Valid=FALSE 的等待点，按配置错误处理（避免假推进/死等）。
+
+---
+
+## 2) Process 端标准写法（你已验证通过的语义）
+
+### Wait（Phase2 / TARGET_SYNC）
+
+* 每周期：`SyncBus[pt].ReqWait := TRUE`
+* 仅当 `DonePulse=TRUE`：
+
+  * `SyncBus[pt].ReqWait := FALSE`（撤销声明）
+  * `doneCond` 才允许保持 TRUE
+
+> 这个写法保证：不丢放行、不会 ReqWait 常驻、Broker 能正确回到空闲态。
+
+---
+
+## 3) Broker 端标准语义（邮箱）
+
+1. 选择事件源：外部优先，其次流程发布。
+2. eventId 变化 → `PubToken++`（只接纳一次）。
+3. 当 `ReqWait=TRUE 且 LastSeenToken<PubToken`：
+
+   * `DonePulse=TRUE（一拍）`
+   * `LastSeenToken := PubToken`（消费到最新）
+
+> Broker **不负责** 清 `ReqWait`（除非你选择把清零策略挪到 Broker，这会改变边界）。
+
+---
+
+## 4) 快速验收点（上线前必看）
+
+* 放行完成后的收敛态必须满足：
+
+  * `ReqWait=FALSE`
+  * `Busy=FALSE、State=0`
+  * `LastSeenToken == PubToken`
+
+* 若出现：`LastSeenToken==PubToken` 但 `ReqWait=TRUE/Busy=TRUE`
+  → 说明 Process 忘了撤销等待声明（或有人持续写 TRUE）。
+
+---
+
+如果你愿意，我下一步可以把这份一页纸再补一小段 **“常见故障定位表”**（例如：DonePulse 总抓不到、ReqWait 常驻、Token 不增、外部发布重复等），每条对应“看哪几个字段/第一嫌疑点是谁”。
