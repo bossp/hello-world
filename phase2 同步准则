@@ -1,0 +1,175 @@
+下面这页就是你要的 **“Phase2 对象等待规范表（S2 版本）”**：一页就够，后面所有对象都按这个写，不再靠猜信号流。
+
+---
+
+# S2 Phase2 对象等待规范表
+
+> 适用范围：`FB_Process_S2` 的 **Phase2: Wait**（仅对 `Action.Wait=TRUE` 的对象生效）
+> 目标：统一“等待语义”，保证 **必须先看到 FALSE，再承认 TRUE**，并且 **Process 不塞对象细节**。
+
+---
+
+## 0. 总规则（硬约束）
+
+### R0.1 等待只看对象的 `Q`（Process 不读硬件字、不解码位）
+
+* Process 只依赖对象对外暴露的 `Q.PhysicalDone / Q.LogicalDone / Q.Done / Q.Alarm` 等
+* 禁止在 Process 里读 ZSW、读传感器组合、读 EPOS 内部位
+
+### R0.2 “先 FALSE 后 TRUE”由对象负责
+
+* Process 不自己做“SeenFalse”锁存
+* 对象必须保证：**新 Cmd 实例开始时，PhysicalDone 必须先为 FALSE**（或具备 FALSE→TRUE 资格判据）
+
+### R0.3 统一等待模板：**PhysicalDone → Commit → LogicalDone**
+
+* 对任何需要严谨“动作完成确认”的对象，Phase2 一律用统一模板（见第 2 节）
+
+---
+
+## 1. Wait 生效条件（Phase2 入口规则）
+
+只有当满足以下条件，Phase2 才对该 Action 进行等待判断：
+
+* `Action.Enable = TRUE`
+* `Action.Wait = TRUE`
+* `TargetType` 对应对象存在且索引有效
+  否则等同“立即满足”，避免误配卡死。
+
+---
+
+## 2. 统一等待模板（推荐且默认）
+
+### 2.1 模板语义
+
+> 对象必须提供：
+
+* `Q.PhysicalDone`：**物理完成**（对象内部确保 FALSE→TRUE 资格）
+* `Q.LogicalDone`：**逻辑完成锁存**（由 Commit 触发锁存）
+* `I.CommitPulse` / `I.CommitCmdID`：握手锁存输入（若对象支持）
+
+> Phase2 逻辑：
+
+1. **先等 PhysicalDone**
+
+* `PhysicalDone=FALSE` → `doneCond:=FALSE`（继续等）
+
+2. **PhysicalDone=TRUE 后发 Commit**
+
+* 若 `LogicalDone=FALSE`：发 `CommitPulse`，并 `doneCond:=FALSE`（必须等待锁存完成）
+
+3. **最终以 LogicalDone 放行**
+
+* `LogicalDone=TRUE` → 本对象满足等待
+
+### 2.2 模板代码（你工程的可粘贴版本）
+
+```scl
+// ---- Phase2 / TARGET_* / Wait Template ----
+IF NOT Obj.Q.PhysicalDone THEN
+    #doneCond := FALSE;
+ELSE
+    IF NOT Obj.Q.LogicalDone THEN
+        Obj.I.CommitCmdID := #Inner_AutoCmdID;
+        Obj.I.CommitPulse := TRUE;
+        #doneCond := FALSE;
+    END_IF;
+END_IF;
+```
+
+> 说明：这段模板是“过程层协议”，对象内部怎么判 PhysicalDone 不归 Process 管。
+
+---
+
+## 3. Servo 对象等待规范（FB_ServoCtrl_S2 + Process）
+
+### 3.1 Servo Wait 适用命令集合（白名单）
+
+在 Process Phase2，Servo 只有在以下 Cmd 下才走“统一模板”：
+
+* `MOVE_ABS / MOVE_REL`
+* `POWER_ON / POWER_OFF`
+* `STOP`
+* `ACK_FAULT`
+
+其它 Cmd：即使 `Wait=TRUE` 也视作立即满足（防误配卡死）。
+
+### 3.2 ServoCtrl 对 `Q.PhysicalDone` 的职责分配
+
+#### A) MOVE 类（必须严格）
+
+* BusyBit：ZSW2.15
+* DoneBit：ZSW2.2
+* 必须满足：**BusySeen** + **Busy=0** + **DoneBit=1**
+* BusySeen 可“保险”补充：DoneBit=1 也认为 BusySeen（防极快完成）
+
+#### B) POWER_ON / POWER_OFF（必须 FALSE→TRUE）
+
+* POWER_ON：必须先见 `AxisEnabled=FALSE`，再见 TRUE 才算 PhysicalDone
+* POWER_OFF：必须先见 `AxisEnabled=TRUE`，再见 FALSE 才算 PhysicalDone
+
+> 这条是你“核心交互信号必须先看到 FALSE”的典型落地。
+
+#### C) STOP / ACK_FAULT（不强制 FALSE→TRUE，允许立即完成）
+
+* STOP：可用 `Busy=0` 即 PhysicalDone
+* ACK：可用 `drvFault=FALSE` 即 PhysicalDone
+  （是否要强制 FALSE→TRUE，未来可再定，但当前按你说的“不强制”）
+
+### 3.3 Process Phase2 对 Servo 的唯一职责
+
+* 不读 AxisEnabled/ZSW
+* 不区分运动/使能/复位细节（只白名单）
+* 统一模板锁存 LogicalDone 后放行
+
+---
+
+## 4. Cylinder 对象等待规范（示意）
+
+如果 Cylinder 目前只有 `Q_Done`，那么两种选择：
+
+### 方案 1：Cylinder 继续“单 Done”模式（保持现状）
+
+Process 只做：
+
+* `IF NOT Cyl.Q_Done THEN doneCond:=FALSE`
+
+### 方案 2：Cylinder 也升级到统一模板（推荐长期）
+
+Cylinder 提供：
+
+* `Q.PhysicalDone`（到位/反馈/无反馈策略）
+* `Q.LogicalDone`（Reset/Commit 锁存）
+* `I.CommitPulse/CommitCmdID`
+
+然后 Process 一律走模板，跟 Servo 完全一致。
+
+---
+
+## 5. Sync 对象等待规范（独立模板）
+
+Sync 的等待语义是“一拍 DonePulse”，不适合 Commit：
+
+* Wait 条件：只认 `DonePulse=TRUE`（一拍）
+* `ReqWait` 必须声明型保持 TRUE，直到 DonePulse 出现
+* 出现 DonePulse 当周期可撤 `ReqWait:=FALSE`（可选）
+
+> Sync 不走 PhysicalDone/LogicalDone 模板，是例外，但规则同样清晰：**只认 DonePulse**。
+
+---
+
+## 6. 禁止写法清单（防再次踩坑）
+
+* ❌ Process 里按 Cmd 去判断 “AxisEnabled / Busy / Fault / ZSW bit”
+* ❌ Process 里自己做 SeenFalse / BusySeen（职责错位）
+* ❌ 非运动命令只等 LogicalDone（会卡死：因为 LogicalDone 需要 Commit）
+* ❌ 等待条件使用“历史残留 TRUE”（必须靠对象保证新 Cmd 的 FALSE→TRUE）
+
+---
+
+如果你认同这页规范，下一步我建议你只做两件事（仍然不重构、不升级）：
+
+1. **把 Process Phase2 的 Servo Wait 改成“白名单 + 统一模板”**（你已经写出来了）
+2. **把 ServoCtrl 的 PhysicalDone 语义完整固化**（MOVE / PWR ON/OFF / STOP / ACK 分开）
+
+你一句话我就能把“可粘贴的替换段”按你 Process 现有代码结构给到精确插入点。
