@@ -1,0 +1,346 @@
+好，下面我把**刚才那份阶段性总结**，**重写为一份“工程设计规范文档版”**。
+这是**可以长期放在项目根目录 / Wiki / 设计说明里的版本**，不是聊天总结。
+
+你可以直接复制保存为：
+
+> **《S2 产线模块化控制系统
+> Servo / Cylinder / Process 设计规范（阶段 v1）》**
+
+---
+
+# S2 产线模块化控制系统
+
+## Servo / Cylinder / Process 设计规范（阶段 v1）
+
+> **文档性质**：工程级规范
+> **适用范围**：S2 架构下的 Servo、Cylinder、Process 控制
+> **状态**：已验证、已投用、冻结语义
+> **目的**：保证多对象、多时序控制的确定性与可扩展性
+
+---
+
+## 1. 设计目标
+
+本规范用于约束 **Process、对象控制块（Servo / Cylinder）与硬件之间的交互语义**，以解决以下工程问题：
+
+* 多轴、多气缸并发控制中的 **Done / Busy 误判**
+* 不同硬件平台下 **状态位语义不一致**
+* 初始化 / 在线下载 / 冷启动对流程的破坏
+* 上层流程与底层硬件的强耦合
+
+**核心目标：**
+
+> **Process 不感知硬件细节，对象块负责物理完成判定，硬件只提供真实状态。**
+
+---
+
+## 2. 系统分层架构
+
+### 2.1 分层总览
+
+```text
+┌──────────────────────────┐
+│        Process 层        │
+│  Step / Action / 时序   │
+└──────────▲──────────────┘
+           │ Commit / Cmd
+┌──────────┴──────────────┐
+│        对象层            │
+│  ServoCtrl / Cylinder   │
+│  PhysicalDone 判定      │
+└──────────▲──────────────┘
+           │ I/O
+┌──────────┴──────────────┐
+│        硬件层            │
+│  Servo / 气缸 / IO       │
+│  状态字 / 传感器         │
+└──────────────────────────┘
+```
+
+---
+
+### 2.2 各层职责边界（强约束）
+
+#### Process 层
+
+**只允许做：**
+
+* Step 顺序控制
+* Action 分发
+* 等待 LogicalDone
+
+**严禁：**
+
+* 读取硬件状态字
+* 判断 Busy / Done 位
+* 感知 AxisPosOk、ZSW 位、传感器细节
+
+---
+
+#### 对象层（ServoCtrl / CylinderCtrl）
+
+**职责：**
+
+* 将“命令实例”映射为物理动作
+* 根据硬件反馈计算 **PhysicalDone**
+* 通过 Commit 形成 **LogicalDone**
+
+**对象层是语义稳定器**，必须冻结接口。
+
+---
+
+#### 硬件层
+
+**职责：**
+
+* 提供真实、原始状态
+* 不做任何语义加工
+
+---
+
+## 3. 命令与实例模型（CmdID 语义）
+
+### 3.1 CmdID = 动作实例
+
+```text
+CmdID 变化 ⇒ 一个新的、不可复用的物理动作实例
+```
+
+**规则：**
+
+* CmdID 必须单调变化
+* 所有 Done / Busy / 计时都以 CmdID 为边界
+
+---
+
+### 3.2 禁止模式
+
+❌ 电平型命令
+❌ 不带实例的 Execute
+❌ Done 不随 CmdID 清零
+
+---
+
+## 4. ServoCtrl 设计规范（FB_ServoCtrl_S2）
+
+### 4.1 状态位来源规范
+
+| 语义          | 来源              |
+| ----------- | --------------- |
+| Busy        | `EPosZSW2.15`   |
+| Done        | `EPosZSW2.2`    |
+| AxisEnabled | `Q_AxisEnabled` |
+
+**禁止使用：**
+
+* AxisPosOk 直接作为完成判据
+
+---
+
+### 4.2 BusySeen / DoneAtStart 机制
+
+#### BusySeen（Inner_VelRunLatched）
+
+```text
+用于确认“本次运动确实发生过”
+```
+
+* 仅由 BusyBit 置位
+* CmdID 新实例时清零
+
+---
+
+#### DoneAtStart（Inner_DoneAtStart）
+
+```text
+记录 CmdID 开始时 DoneBit 的状态
+```
+
+**用途：**
+
+* 防止初始 Done=1 导致“未运动即完成”
+* 允许极快运动的无 Busy 完成路径
+
+---
+
+### 4.3 Motion PhysicalDone 判定（冻结版）
+
+```pascal
+PhysicalDone :=
+(
+    BusySeen
+    OR (NOT DoneAtStart)
+)
+AND Busy = 0
+AND DoneBit = 1;
+```
+
+该逻辑已验证以下场景：
+
+* 快速小行程
+* 初始位置即目标位置
+* Busy 位瞬态不可见
+
+---
+
+### 4.4 非运动命令的方向性约束
+
+#### POWER_ON
+
+```text
+必须观察到：
+AxisEnabled = FALSE → TRUE
+```
+
+#### POWER_OFF
+
+```text
+必须观察到：
+AxisEnabled = TRUE → FALSE
+```
+
+**禁止：**
+
+* 仅凭当前 AxisEnabled 判断完成
+
+---
+
+## 5. Cylinder 控制规范
+
+### 5.1 Process 与 Cylinder 的解耦原则
+
+Process：
+
+* 只发 Extend / Retract
+* 只看 LogicalDone
+
+CylinderCtrl：
+
+* 内部决定是否等反馈
+* 内部处理超时 / 报警
+* 支持三种模型：
+
+  * 双反馈
+  * 单反馈
+  * 无反馈
+
+---
+
+### 5.2 延时规范
+
+* 延时只允许在 Step 层：
+
+  * `PostDelay`
+* 禁止在对象内部私自延时
+
+---
+
+## 6. Step / Action 编写规范
+
+### 6.1 Step 的职责
+
+* 表达 **工艺顺序**
+* 不表达控制策略
+
+---
+
+### 6.2 Action 的标准写法
+
+#### Servo
+
+```pascal
+TargetType := TARGET_SERVO
+Cmd        := cCMD_MOVE_ABS / REL
+ParamType  := 2
+Wait       := TRUE
+```
+
+#### Cylinder
+
+```pascal
+TargetType := TARGET_CYLINDER
+Cmd        := Extend / Retract
+Wait       := TRUE
+```
+
+---
+
+## 7. 初始化（InitWritten）规范
+
+### 7.1 初始化只允许写一次
+
+```pascal
+IF NOT InitWritten THEN
+    // 写 Step / Param
+    InitWritten := TRUE;
+END_IF;
+```
+
+### 7.2 设计目的
+
+* 支持在线下载
+* 不依赖 PLC 冷启动
+* 防止流程中途被覆盖
+
+---
+
+## 8. 已验证的初始化流程范式（示例）
+
+```text
+POWER_ON
+→ Servo 到位
+→ 气缸动作
+→ 延时
+→ Servo 回位
+→ POWER_OFF
+```
+
+该流程已验证：
+
+* Servo + Cylinder 混合顺序
+* 多延时点
+* Enable / Disable 闭环
+
+---
+
+## 9. 冻结项声明（重要）
+
+以下内容在本阶段 **禁止修改**：
+
+* Servo PhysicalDone 判定逻辑
+* CmdID 实例语义
+* Process 不读取硬件状态的原则
+* Enable / Disable 方向性约束
+
+任何修改必须进入下一阶段设计评审。
+
+---
+
+## 10. 阶段结论
+
+本阶段已完成：
+
+* Servo / Cylinder / Process 的完全解耦
+* 多对象时序的确定性执行
+* 工程级初始化与在线维护能力
+
+该架构可直接扩展至：
+
+* 多轴
+* 多气缸
+* 多 Sync / Barrier
+* 不同 PLC / 驱动平台
+
+---
+
+**文档结束**
+
+---
+
+如果你愿意，下一步我可以直接帮你做三件事之一：
+
+1. 把这份规范拆成 **《ServoCtrl 规范》《Process 规范》**
+2. 基于这套规范，写 **正式生产流程 Step**
+3. 把 Sync / Barrier 抽象成“同步对象规范”
+
+你点哪一条，我们继续。
