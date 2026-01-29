@@ -1,0 +1,225 @@
+===========================================================
+Process 时序白皮书 v1.0
+（Loop / Action Group / Sync 统一时序规范）
+===========================================================
+
+状态：FROZEN
+适用范围：
+- FB_Process_S2
+- UDT_StepV2 / UDT_ActionV2
+- FB_SyncBroker
+- FB_CylinderCtrl_V2
+- FB_ServoCtrl_S2
+
+本文件定义 Process 引擎的【时序模型、职责边界、闭环规则】。
+这是硬性规范，不是建议。
+
+-----------------------------------------------------------
+1. 总体设计原则
+-----------------------------------------------------------
+
+Process 引擎采用三种正交机制构建时序闭环：
+
+1) Loop        —— Step 级循环控制
+2) ActionGroup —— Step 内动作并发/顺序
+3) Sync        —— 跨流程 / 跨 Step 同步
+
+三者职责完全独立，禁止交叉控制。
+
+-----------------------------------------------------------
+2. 三大机制职责边界
+-----------------------------------------------------------
+
+[Loop]
+- 只作用于 Step 完成之后
+- 决定是否回跳 (JumpStepNo)
+- 管理 RepeatTotal / PauseEvery
+- 不感知 Action，不感知 Sync
+
+[Action Group]
+- 只作用于单个 Step 内
+- 决定 Action 的并发或顺序
+- 通过 StartGroup 编号控制
+- 不感知 Loop，不感知 Sync 语义
+
+[Sync]
+- 仅作为一种 Action 存在
+- 用于流程间事件同步
+- 通过 Token / DonePulse 完成
+- 不控制 Step / Loop / Group
+
+任何代码若让三者互相代管，视为设计错误。
+
+-----------------------------------------------------------
+3. Step 执行总时序（闭环）
+-----------------------------------------------------------
+
+一个 Step 的完整生命周期如下：
+
+[Step Enter]
+    ↓
+[Action Group 1 Issue]
+    ↓
+[Action Group 1 Wait]
+    ↓
+[Action Group 2 Issue]
+    ↓
+[Action Group 2 Wait]
+    ↓
+[PostDelay]
+    ↓
+[Step Done]
+    ↓
+[Loop 判定]
+    ↓
+[JumpStepNo / Next Step]
+
+-----------------------------------------------------------
+4. Action Group 机制
+-----------------------------------------------------------
+
+4.1 Group 定义
+
+- Action.StartGroup 为 Group 编号（USInt）
+- Group 编号从 1 开始
+- 数值越小，优先级越高
+
+4.2 Group 调度规则
+
+- 系统每次只执行“当前最小 StartGroup”
+- 同一 Group 内的 Action 在同一周期发命令
+- Group 必须全部完成才进入下一个 Group
+
+4.3 Group 完成条件
+
+- Group 内所有 Action 中：
+  - Wait = TRUE 的 Action Done
+- Wait = FALSE 的 Action 永不阻塞 Step
+
+-----------------------------------------------------------
+5. Action 类型与 Done 语义
+-----------------------------------------------------------
+
+[Cylinder Action]
+- Done 来自 FB_CylinderCtrl_V2.Done
+- Done 为锁存语义（CmdID 边沿清零）
+
+[Servo Action]
+- PhysicalDone → CommitPulse → LogicalDone
+- Step 只认 LogicalDone
+
+[Sync Publish Action]
+- Cmd = SYNC_CMD_PUBLISH
+- Wait = FALSE
+- 发出即完成
+- 增加 PubToken
+
+[Sync Wait Action]
+- Cmd = SYNC_CMD_WAIT
+- Wait = TRUE
+- 等待 DonePulse（一拍）
+- Done 后立即释放
+
+-----------------------------------------------------------
+6. Sync 同步机制
+-----------------------------------------------------------
+
+6.1 同步模型
+
+- 每个 Sync 点维护：
+  - PubToken
+  - LastSeenToken
+- Token 单调递增
+- DonePulse = Token 被消费的瞬间
+
+6.2 Publish 规则
+
+- Publish 不阻塞流程
+- 同 CmdID 的重复 Publish 被忽略
+- Publish 只负责“发事件”
+
+6.3 Wait 规则
+
+- ReqWait=TRUE 表示声明等待
+- 当 LastSeenToken < PubToken：
+  - 产生 DonePulse
+  - 消费 Token
+- DonePulse 只保持一拍
+
+-----------------------------------------------------------
+7. Loop 机制
+-----------------------------------------------------------
+
+7.1 Loop 生效时机
+
+- Loop 只在 Step 完成之后判定
+- Step 未完成时，Loop 不参与任何逻辑
+
+7.2 Loop 条件
+
+LoopId ≠ 0 且：
+- RepeatTotal > 1
+
+7.3 Loop 判定流程
+
+IF LoopCnt < RepeatTotal:
+    LoopCnt++
+    Jump to JumpStepNo
+ELSE:
+    LoopCnt := 0
+    Continue to next Step
+
+7.4 JumpStepNo 语义
+
+- JumpStepNo 是 Loop 的物理落点
+- Jump 本身不等于 Loop
+- Jump 可被 Loop 或非 Loop 使用
+
+-----------------------------------------------------------
+8. PauseEvery 机制
+-----------------------------------------------------------
+
+- PauseEvery 仅在 Loop 中生效
+- Pause 插入点位于：
+  Step 完成 → Loop 判定 之间
+
+规则：
+IF (LoopCnt MOD PauseEvery) = 0:
+    Pause
+    等待 Confirm
+    恢复 Loop
+
+-----------------------------------------------------------
+9. 错误与禁止行为（硬性）
+-----------------------------------------------------------
+
+禁止：
+- 在 Action 中修改 Loop 变量
+- 在 Loop 中判断 Action Done
+- 用 Sync 控制 Action 并发
+- 用 Group 模拟流程同步
+- 用 Wait=FALSE 代替 Sync Wait
+
+任何违反以上规则的实现：
+- 视为逻辑错误
+- 不允许合入主线
+
+-----------------------------------------------------------
+10. 冻结声明
+-----------------------------------------------------------
+
+本白皮书定义的：
+
+- 时序顺序
+- Done 判定
+- Loop / Group / Sync 交互边界
+
+已与当前工程实现完全一致。
+
+后续版本：
+- 只允许扩展
+- 不允许修改既有语义
+
+===========================================================
+END OF FILE
+===========================================================
