@@ -1,0 +1,132 @@
+行，那我就按你现在这套 **ServoCtrl_S3 + AxisS3**，把“像工艺表一样”的**命令语义表 + 自检清单**给你一份，你下次直接贴这份给我/给团队就能对齐思路。
+
+---
+
+## 一、你的哲学思想（可直接当“前置约束”贴给我）
+
+1. **事务逻辑 vs 状态逻辑必须分离**
+
+* **事务逻辑**：一条命令从触发 → 执行 → 物理完成 → 提交(Commit) → 清理，必须闭环。
+* **状态逻辑**：只负责“允许/禁止/显示”，例如 Enable、Standstill、Fault、Homed 等；**状态不能替代事务完成**，也不能被 OR 进事务 Busy/Done。
+
+2. **命令必须“独立闭环”**（每条命令自己有完整应答流程）
+
+* PowerOn/Off、Home、Abs、Rel、Vel、Stop、Reset、Jog：每条都要有自己的 Trigger / Done / Abort / Clear。
+* 禁止把不同命令揉成一坨 OR，导致“看不出到底在忙什么”。
+
+3. **块与块交互必须用“脉冲 + 锁存”的握手**
+
+* 底层（AxisS3）多为 Done Pulse（1 扫描），上层（ServoCtrl）必须 **PhysicalDoneLatch** 才能等到 Commit。
+* Commit 是上层/流程的事务确认：**CommitPulse + CmdID match + PhysicalDoneLatch** 才能把 LogicalDone 置位。
+
+4. **流程必须考虑全路径**
+   起点、结束、停止、复位、重复命令、命令抢占、故障/Abort、许可撤销——都要在设计时显式考虑，不能靠“实测碰运气”。
+
+5. **目标是清晰、解耦、可扩展**
+   像拆工艺表一样：抽象、分层、职责单一、单点定义、单点清理。
+
+---
+
+## 二、命令语义表（像工艺表一样的“事务表”）
+
+> 你以后加命令，就照着加一行；每一列都写全，代码就不会漏。
+
+### 1）POWER（Kind=1，事务型）
+
+* **Trigger**：上层 CmdID edge（PowerOn/PowerOff）
+* **Dispatch**：Axis.I_Enable（由 EnablePermit + EnableReq + Mode 门控）
+* **PhysicalDone**：AxisS3：`powerOkLevel` 达成 → DoneKind=1（或 PowerLatched + powerOkLevel）
+* **上层握手**：Axis.Q_Done(Kind=1) 是 pulse → ServoCtrl 必须 latch → 等 Commit
+* **Abort**：Stop / Reset / Error / CommandAborted / NewCmd
+* **重复命令策略（关键）**：
+
+  * 若当前已满足目标状态（已 ON 再发 ON，已 OFF 再发 OFF）：**必须“立即物理完成”**（产出可被 latch 的完成条件），否则 Busy 会卡死
+
+### 2）HOME（Kind=3）
+
+* Trigger：CmdID edge + HomeCmd
+* Dispatch：Axis.I_Home_Exe 一拍
+* PhysicalDone：fbHome.Done（通常是 pulse/level）
+* Abort：Stop/Reset/Error/Aborted/NewCmd
+
+### 3）ABS（Kind=4）
+
+* Trigger：CmdID edge
+* Dispatch：Axis.I_MoveAbs_Exe 一拍 + 目标参数锁存
+* PhysicalDone：fbAbs.Done
+* Abort：Stop/Reset/Error/Aborted/NewCmd
+
+### 4）REL（Kind=5）
+
+同 ABS
+
+### 5）VEL（Kind=6）
+
+* Trigger：CmdID edge 进入（你 AxisS3 用 Inner_VelLatched）
+* Dispatch：Axis.I_MoveVel_Exe 一拍，后续靠 latch 维持 Busy
+* Done：ConstantVelocity 上升沿（进入速度态）
+* Abort：Stop/Reset/Error/Aborted/（退出速度态要清 latch）
+
+### 6）STOP（Kind=8）
+
+* Trigger：STOP CmdID edge（只由 STOP 命令触发事务）
+* Dispatch：Axis.I_Halt_Exe（由上层 Hold latch 决定）
+* Done：Standstill（建议允许 level 或 edge，避免“已经静止却等不到 rising”）
+* Abort/Clear：达到 Standstill 或 Aborted/Error 或 NewCmd
+
+### 7）RESET（Kind=2）
+
+* Trigger：ResetReq rising 或 ACK_FAULT CmdID edge
+* Dispatch：Axis.I_ResetPulse 一拍（你现在是 ResetPending + one-shot）
+* Done：fbReset.Done
+* Abort：Stop/NewCmd（视你策略）
+
+### 8）JOG（Kind=7，电平型）
+
+* Trigger：ManJogPos/Neg level（非 CmdID）
+* Dispatch：Axis.I_JogFwd/Bwd level
+* Busy：只在 Jog level 存在时 busy
+* Abort：ManStop 或松开 Jog 或 Stop/Reset/Error
+
+---
+
+## 三、你这次踩到的“OFF 再发 OFF Busy 卡住”的本质
+
+* **根因不是 Busy 算错**，而是：
+  “重复命令（已在目标状态）时，没有产生**可被上层锁存的 PhysicalDone**，导致上层事务一直处于 AutoBusy，Commit 也抓不到正确的完成闭环。”
+
+一句话：**重复命令必须走完整闭环，但允许“零动作立即完成”。**
+
+---
+
+## 四、完整性自检清单（防漏/防重）
+
+每条命令必须打勾这 8 条路径：
+
+1. 正常完成（Done→Commit→Clear）
+2. Stop 打断
+3. Reset 打断
+4. Error 打断
+5. CommandAborted
+6. **重复命令：已在目标状态**
+7. 命令抢占：A 未完成来了 B（NewCmd）
+8. 许可撤销（EnablePermit/EnableReq/Mode）导致安全清理
+
+---
+
+## 五、“表格化写代码”的固定顺序（你以后写任何 FB 就照这个顺序）
+
+1. 默认输出清零（pulse 全 FALSE）
+2. 事件化（CmdID edge / Reset edge / Stop edge）
+3. 参数锁存（ParamIdx/Type/目标）
+4. 抢占优先级（Reset/Stop/Abort）
+5. 事务选择（MotionLatched/ActiveKind）
+6. 单点派发（Axis.I_* 只在一个区域写）
+7. PhysicalDone 生成（pulse→latch）
+8. Commit→LogicalDone
+9. Busy 只由事务层计算
+10. 清理只发生在：NewCmd / Abort / Commit
+
+---
+
+如果你下一步要我继续，我建议你把这份表作为“规范文档”固化，然后我再按这个表帮你把 **POWER 的重复命令“立即完成”**规则，分别在 **AxisS3** 和 **ServoCtrl_S3** 的最小补丁里落实（不改接口、不改结构）。
