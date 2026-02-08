@@ -1,0 +1,158 @@
+下面这份就是你这套架构的“设计原则（可直接贴给我/贴到项目文档）”。我按你强调的 **事务 vs 状态**、**流程起点/分支/结束**、**块间交互脉冲+锁存** 来写，并补上你这次踩坑总结出来的关键点（重复命令、已满足状态、Busy/Done 清理）。
+
+---
+
+# 控制逻辑设计原则（事务解耦 + 状态解耦 + 清晰闭环）
+
+## 0. 总目标
+
+* **清晰**：每条命令都有独立闭环与可解释的状态输出。
+* **解耦**：流程（Process）不依赖底层实现细节；底层对象不混入流程策略。
+* **可验证**：每条命令都能用统一的测试步骤验证（触发→执行→完成→提交→清理）。
+
+---
+
+## 1) 事务逻辑 vs 状态逻辑必须分离
+
+### 1.1 事务逻辑（Transactional）
+
+事务逻辑回答：**“我发的这条命令，从开始到结束有没有完成？”**
+
+* 以 **CmdID 变化**作为命令触发（事件化），禁止用 Cmd 位电平驱动事务。
+* 每条命令必须对应一个 **事务 Kind**（Power/Reset/Stop/Home/Abs/Rel/Vel/Jog…），并且 **互斥**。
+* 事务必须具备完整闭环：
+
+  1. Start（CmdID edge）
+  2. Execute（内部持有/驱动底层）
+  3. PhysicalDone（底层完成条件满足）
+  4. Commit（流程层确认）
+  5. LogicalDone（事务完成锁存）
+  6. Cleanup（Busy 清、锁存清、允许下一事务）
+
+### 1.2 状态逻辑（State / Level）
+
+状态逻辑回答：**“轴现在处于什么状态、允许做什么？”**
+
+* 状态只做**前置条件/门控**与**诊断显示**，不参与事务闭环的判定。
+* 状态不能直接 OR 进 Busy/Done，避免“揉在一起导致不可解释”。
+* 典型状态：EnablePermit / AxisEnabled / Standstill / AxisError / Homed / PosOk 等。
+
+> 核心约束：**事务输出（Busy/Done/Kind）必须可追溯到某一次 CmdID 触发**；状态输出只是背景条件。
+
+---
+
+## 2) 流程（Process）必须明确：起点、分支、结束、停止、复位、重复、等待
+
+### 2.1 起点（Start）
+
+* 流程起点只做：初始化 Step 指针、清空流程级 latch、准备发第一条 CmdID。
+* 起点不“偷偷执行动作”，动作必须表现为明确的事务命令。
+
+### 2.2 分支（Branch）
+
+* 分支条件必须基于**流程层可解释信号**（例如：某事务 LogicalDone、某报警锁存、某同步点 Done）。
+* 禁止用底层临时 Busy/瞬态 Done 直接驱动分支，避免“抖动跳转”。
+
+### 2.3 结束（End）
+
+* 流程结束必须定义：输出状态、清理策略（是否保持最后 Done、是否释放 Busy、是否复位 Step）。
+* 结束状态下必须能“稳定停住”，不能被残留 latch 再次触发。
+
+### 2.4 停止 / 复位（Stop / Reset）位置原则
+
+* Stop、Reset 属于**跨步骤的强制路径**，必须在流程循环最前面统一处理（高优先级）。
+* Stop 是“安全停机事务”，Reset 是“清故障事务”，两者不能混在普通动作里。
+
+### 2.5 重复 / 循环（Repeat / Loop）
+
+* Repeat 是流程策略，不是对象内部逻辑。
+* 事务对象只负责“单次命令闭环”；重复由流程层发新的 CmdID 来实现。
+
+### 2.6 等待 / 同步（Wait / Sync）
+
+* 等待属于流程对象（例如 SyncPoint/Barrier/TokenLatch），而不是掺在某个动作 FB 里用 TON 硬等。
+* “工艺内部等待”“工艺之间同步等待”都要抽象成对象，统一由 Process 执行与提交。
+
+---
+
+## 3) 块之间的交互：脉冲 + 锁存 + 提交（Commit）协议
+
+### 3.1 事件触发：CmdID Edge
+
+* **唯一触发源**：CmdID 变化。
+* Cmd 字段只是“这次命令是什么”，但不能用电平持续触发。
+
+### 3.2 物理完成（PhysicalDone）与逻辑完成（LogicalDone）
+
+* PhysicalDone 来源于底层对象（Axis3）的 Kind-specific 完成条件。
+* 因为底层 Done 往往是**一拍脉冲**，上层必须采用：
+
+  * **PhysicalDoneLatch**（锁存物理完成），直到 Commit 或 Abort/NewCmd 清除
+* LogicalDone 只能由：
+
+  * `CommitPulse`（一拍） + `CommitCmdID == CmdID` + `PhysicalDoneLatch == TRUE`
+  * 形成 `LogicalDoneLatched`
+
+> 这就是“交互式提交”模型：底层说“我做完了”，流程层说“我确认并进入下一步”。
+
+### 3.3 Abort / NewCmd / Fault 的清理规则（必须统一）
+
+* **NewCmd**：清 LogicalDoneLatched、清 PhysicalDoneLatched、更新 ActiveCmdID
+* **AbortHit / Error / CommandAborted**：清 LogicalDoneLatched、清 PhysicalDoneLatched、清 MotionLatched（回 Idle）
+* **Commit 成功**：清 PhysicalDoneLatched（防止重复 commit）、保留 LogicalDoneLatched（直到下一条 CmdID）
+
+---
+
+## 4) Busy 的定义必须一致且可解释
+
+* Busy 代表“当前存在未完成的事务或手动动作”，不是“轴某个状态位为真”。
+* Busy 只能由事务层产生：
+
+  * AutoTxnBusy（MotionLatched 属于事务集合，且 LogicalDone 未完成，且非 abort）
+  * ManJogBusy（Jog 处于电平动作且未停止）
+* **禁止把 Axis.Q_Busy 直接 OR 进 ServoCtrl Busy**，否则会回到 S2 的“揉成一团”。
+
+---
+
+## 5) “已满足状态下重复命令”的原则（你这次的关键坑）
+
+当系统已经处于目标状态（例如已经 OFF 再发 OFF；已经 ON 再发 ON）：
+
+* 行为必须明确为以下之一（项目选一种并固化）：
+
+  1. **立即完成型**：直接置 PhysicalDoneLatch（等效“零动作事务”），允许 Commit 清 Busy
+  2. **短事务型**：允许 Busy 短暂为 TRUE，但必须保证底层会给出可完成条件（否则会卡死）
+
+核心要求：
+
+* 不允许出现：“重复命令进入 Busy，但永远等不到 PhysicalDone → Commit 清不掉”。
+
+---
+
+## 6) 命令表驱动思想（“像工艺表格一样抽象”）
+
+* 每条命令在语义上必须能写成一行表格：
+
+  * 触发条件（CmdID edge / 手动电平）
+  * 前置门控（Enable、无故障、非 Reset 等）
+  * 底层驱动（Axis I_XXX）
+  * 完成条件（Axis DoneKind/状态位）
+  * Abort 条件（StopLevel/Reset/Error/CommandAborted）
+  * 提交条件（CommitPulse + CmdID match）
+  * 清理规则（NewCmd/Abort/Commit）
+
+这样才能做到：
+
+* 可读、可维护、可扩展、可测试、跨平台一致。
+
+---
+
+## 7) 你希望我工作的“边界与责任”
+
+* 责任：**检查块与块对接后**的完整性、一致性、时序闭环（从触发到清理）。
+* 约束：不做无关重构、不发散结构、不把状态 OR 回事务。
+* 输出必须能让你做现场验证：给出“测试步骤 + 预期信号变化”。
+
+---
+
+如果你愿意，我可以把上面这套原则再压缩成 **“10 条硬约束”**（每条一句话）做成你下次发我的“前置规范模板”。这样你一贴，我就会自动按这套思维检查对接与闭环。
