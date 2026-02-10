@@ -1,0 +1,204 @@
+下面这份就是你要的 **“代码审查用断言清单（SyncPoint / Process / Broker）”**：每条都写成**可直接对照代码的检查点**（变量名/Phase/位置），你拿它去扫你现在那份 Process + Broker，立刻就知道哪里不收敛、哪里吃时序。
+
+---
+
+# SyncPoint 代码审查断言清单（可执行/可对照）
+
+> 目标：用最少条目覆盖 **邮箱语义、生命周期闭环、Tᴿ/Tᴼ 抗干扰、报警锁存规范**。
+> 适用：`FB_Process_*` + `FB_SyncBroker/Resolve` + 外部事件适配逻辑（按钮/上位机）。
+
+---
+
+## A. Process 侧断言（等待/发布必须在 Process 里“声明意图”）
+
+### A1. 等待意图保持型（ReqWait）
+
+**断言**：当且仅当当前 Step 的某个 Action 是 `TARGET_SYNC + Wait=TRUE` 时：
+
+* `SyncBus[sync].ReqWait` **每周期都必须被写 TRUE**（Phase2 期间持续）。
+* 读取到 `DonePulse=TRUE` 的同一周期，**必须写** `ReqWait := FALSE`（退出等待态）。
+
+✅ 你代码里应出现类似结构（Phase2/WAIT）：
+
+```scl
+SyncBus[sync].ReqWait := TRUE;
+IF SyncBus[sync].DonePulse THEN
+    SyncBus[sync].ReqWait := FALSE;
+ELSE
+    doneCond := FALSE;
+END_IF;
+```
+
+❌ 反例（违规）：只在 Phase1/Issue 写一次 ReqWait；Phase2不再写。
+
+---
+
+### A2. 发布请求邮箱语义（ReqPublish + PubCmdID）
+
+**断言**：当 Action 是 `TARGET_SYNC + Cmd=PUBLISH` 时：
+
+* 必须写 `SyncBus[sync].ReqPublish := TRUE`
+* 必须写 `SyncBus[sync].PubCmdID := DINT(某个会变化的ID)`
+* `PubCmdID != 0`（0 无效）
+
+✅ 推荐绑定你现有的事务号：
+
+```scl
+SyncBus[sync].ReqPublish := TRUE;
+SyncBus[sync].PubCmdID := INT_TO_DINT(Inner_StepCmdID);
+```
+
+❌ 反例：只写一个“Cmd=Publish”到 Step 表，不写 SyncBus 请求口。
+
+---
+
+### A3. 发布的 Cmd 常量一致性（最常见坑）
+
+**断言**：Step 初始化里写的 `Actions[].Cmd` 数值，必须与 Process 里分支判定一致。
+
+* 若 Process 写死 `Cmd=INT#1/2/3`
+  → 则 `"SYNC_CMD_PUBLISH"` 必须真的等于 1（WAIT=2,CLEAR=3）
+* 或者 Process 必须用常量判等：
+
+```scl
+IF Cmd = USINT_TO_INT("SYNC_CMD_PUBLISH") THEN ...
+```
+
+✅ 检查方法：在线监视 `Step.Actions[].Cmd` 的最终值是否为 1/2/3。
+
+---
+
+### A4. Valid 的职责归属
+
+**断言**：Process 不应该“猜测 Valid”。
+
+* 若 Process 要求 `SyncBus[sync].Valid=TRUE` 才工作，则工程必须在初始化/配方里显式置位。
+* Process 只能把 Valid 当作“配置门控”，不负责自动修复。
+
+✅ 你代码里现在是硬门控 `IF NOT Valid THEN 723 STOP`，这没问题，前提是工程确实配了 Valid。
+
+---
+
+### A5. 推进唯一依据：DonePulse
+
+**断言**：任何等待同步的 Step 推进，只允许依赖 `DonePulse`。
+
+* 禁止依赖 `Busy/State`
+* 禁止依赖 `PubToken` 变化（那是 Broker 内部指标）
+
+---
+
+## B. Broker/Resolve 侧断言（去重与放行必须稳定）
+
+### B1. DonePulse 单拍
+
+**断言**：每周期开始（每点）必须先：
+
+```scl
+DonePulse := FALSE;
+```
+
+并且只有在 **“等待中且发现新Token”** 的那一拍置 TRUE。
+
+---
+
+### B2. 发布去重唯一依据：CmdID
+
+**断言**：发布条件必须满足：
+
+* `eventHit=TRUE`
+* `eventId != 0`
+* `eventId != LastPubCmdID`
+  才允许：
+* `PubToken++`
+* `LastPubCmdID := eventId`
+
+❌ 反例：用 ExtPubReq 的上升沿当“新事件”。
+
+---
+
+### B3. 消费语义固定（消费到最新）
+
+**断言**：当 `ReqWait=TRUE` 且 `LastSeenToken < PubToken` 时：
+
+* `DonePulse := TRUE`
+* `LastSeenToken := PubToken`（消费到最新）
+* 停止超时计时器
+
+> 若你未来想改为“只消费一次”（LastSeenToken++），必须全工程统一，不能一会儿一种。
+
+---
+
+### B4. ReqPublish 清零（邮箱语义）
+
+**断言**：内部发布请求应在 Broker Resolve 后清零：
+
+```scl
+ReqPublish := FALSE;
+```
+
+外部 `ExtPubReq` 不强制清也必须不重复（由 CmdID 去重保证）。
+
+---
+
+### B5. Alarm 锁存清除规则（必须对齐你的锚点）
+
+**断言**：
+
+* 超时/冲突等异常只负责置位 `Alarm` + `LastError`（锁存）
+* **清除只能由 `ResetAlarm` 上升沿**（在 Broker 或统一 Alarm 管理层实现）
+* 禁止“离开等待步自动清 Alarm/LastError”作为隐式规则（除非你明确写进规范并全局一致）
+
+---
+
+## C. 系统级断言（Tᴼ 扫描顺序必须无关）
+
+### C1. 必须形成闭环调用顺序（最关键）
+
+**断言**：同一周期必须满足以下顺序之一（选一个全工程统一）：
+
+✅ 推荐顺序（最不吃时序）：
+
+1. **Process 写 SyncBus 请求口**（ReqWait/ReqPublish/PubCmdID/Timeout）
+2. **Broker Resolve**（产生 DonePulse）
+3. **Process 读取 DonePulse 并推进**（或者下一拍推进也行，但必须一致）
+
+❌ 反例：Broker 在 Process 之后运行，且 DonePulse 在 Broker 内每周期开头清零 → Process 永远读不到 DonePulse。
+
+> 你现场最容易出现的“不生效”，90% 都是这条没满足。
+
+---
+
+## D. 外部事件适配断言（你“ReqWait 门控 + CmdID++”那套）
+
+### D1. ReqWait 门控
+
+**断言**：外部事件只有在 `ReqWait=TRUE` 时才允许进入系统：
+
+```scl
+IF SyncBus[s].ReqWait THEN
+   // 允许响应外部输入
+END_IF;
+```
+
+### D2. ExtPubReq 不看沿，CmdID 决定新事件
+
+**断言**：外部输入可以保持 TRUE / 抖动，不得导致重复发布；
+唯一新事件判据是 `ExtPubCmdID` 变化。
+
+### D3. eventId=0 防护
+
+**断言**：CmdID++ 后若变 0 必须改为 1。
+
+---
+
+# 你现在拿这份清单怎么用（建议顺序）
+
+1. 先看 **C1 调用顺序**（决定你是不是“永远看不到 DonePulse”）
+2. 再看 **A3 Cmd 常量一致性**（最常见“写了Publish但分支没进”）
+3. 再看 **A4 Valid 是否配置**（Valid=FALSE 直接全停）
+4. 最后用 A1/A2/B2/B3 把邮箱语义闭环检查一遍
+
+---
+
+如果你把 **OB1 里 Process/Broker 的调用顺序**贴出来（两行就够），我可以用这份断言表直接给你判定：你现在“不生效”究竟卡在 C1 还是 A3/A4。
